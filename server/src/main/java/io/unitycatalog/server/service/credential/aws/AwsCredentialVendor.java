@@ -8,6 +8,7 @@ import io.unitycatalog.server.service.credential.CredentialContext;
 import io.unitycatalog.server.utils.NormalizedURL;
 import io.unitycatalog.server.utils.ServerProperties;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import lombok.Getter;
@@ -116,6 +117,17 @@ public class AwsCredentialVendor {
       return new CredentialsGenerator.StaticCredentialsGenerator(config);
     }
 
+    // Static credentials (e.g. MinIO / S3-compatible): accessKey + secretKey, no role to assume
+    boolean hasStaticCreds =
+        config.getAccessKey() != null
+            && !config.getAccessKey().isEmpty()
+            && config.getSecretKey() != null
+            && !config.getSecretKey().isEmpty();
+    boolean noRoleToAssume = config.getAwsRoleArn() == null || config.getAwsRoleArn().isEmpty();
+    if (hasStaticCreds && noRoleToAssume) {
+      return new CredentialsGenerator.StaticCredentialsGenerator(config);
+    }
+
     return createStsCredentialsGenerator(config);
   }
 
@@ -140,5 +152,13 @@ public class AwsCredentialVendor {
               context.getStorageBase(), storageBase -> createPerBucketCredentialsGenerator(config));
     }
     return generator.generate(context);
+  }
+
+  /**
+   * Returns the S3 storage config for the given context's storage base, if any. Used to pass
+   * endpoint URL (and other S3-compatible settings) to API responses.
+   */
+  public Optional<S3StorageConfig> getS3StorageConfigForContext(CredentialContext context) {
+    return Optional.ofNullable(perBucketS3Configs.get(context.getStorageBase()));
   }
 }

@@ -3,6 +3,7 @@ package io.unitycatalog.spark.auth.storage;
 import io.unitycatalog.spark.UCHadoopConf;
 import org.apache.hadoop.conf.Configuration;
 import org.sparkproject.guava.base.Preconditions;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
@@ -20,11 +21,11 @@ public class AwsVendedTokenProvider extends GenericCredentialProvider
   @Override
   public GenericCredential initGenericCredential(Configuration conf) {
     if (conf.get(UCHadoopConf.S3A_INIT_ACCESS_KEY) != null
-        && conf.get(UCHadoopConf.S3A_INIT_SECRET_KEY) != null
-        && conf.get(UCHadoopConf.S3A_INIT_SESSION_TOKEN) != null) {
+        && conf.get(UCHadoopConf.S3A_INIT_SECRET_KEY) != null) {
 
       String accessKey = conf.get(UCHadoopConf.S3A_INIT_ACCESS_KEY);
       String secretKey = conf.get(UCHadoopConf.S3A_INIT_SECRET_KEY);
+      // Session token can be null for MinIO / static credentials
       String sessionToken = conf.get(UCHadoopConf.S3A_INIT_SESSION_TOKEN);
 
       long expiredTimeMillis =
@@ -51,10 +52,21 @@ public class AwsVendedTokenProvider extends GenericCredentialProvider
     Preconditions.checkNotNull(
         awsTempCred, "AWS temp credential of generic credentials cannot be null");
 
-    return AwsSessionCredentials.builder()
-        .accessKeyId(awsTempCred.getAccessKeyId())
-        .secretAccessKey(awsTempCred.getSecretAccessKey())
-        .sessionToken(awsTempCred.getSessionToken())
-        .build();
+    // MinIO / static credentials often have no session token. The UC API may omit session_token
+    // (Java client returns null) or send "". AWS SDK v2 AwsSessionCredentials requires non-null
+    // sessionToken, so use AwsBasicCredentials when missing or blank. This is why local
+    // test-spark-minio-create-insert.sh can work (server may send "") while Kyuubi/FluxEngine
+    // can NPE (server or client returns null)—fix lives here in the connector only.
+    String sessionToken = awsTempCred.getSessionToken();
+    boolean hasSessionToken = sessionToken != null && !sessionToken.isBlank();
+    if (hasSessionToken) {
+      return AwsSessionCredentials.builder()
+          .accessKeyId(awsTempCred.getAccessKeyId())
+          .secretAccessKey(awsTempCred.getSecretAccessKey())
+          .sessionToken(sessionToken.trim())
+          .build();
+    }
+    return AwsBasicCredentials.create(
+        awsTempCred.getAccessKeyId(), awsTempCred.getSecretAccessKey());
   }
 }

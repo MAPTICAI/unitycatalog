@@ -17,6 +17,8 @@ import org.apache.hadoop.fs.s3a.AWSCredentialProviderList;
 import org.apache.hadoop.fs.s3a.Constants;
 import org.apache.hadoop.fs.s3a.auth.CredentialProviderListFactory;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 
@@ -102,6 +104,24 @@ public class AwsVendedTokenProviderTest extends BaseTokenProviderTest<AwsVendedT
         .hasMessage(
             "Credential UID cannot be null or empty, '%s' is not set in hadoop configuration",
             UCHadoopConf.UC_CREDENTIALS_UID_KEY);
+  }
+
+  /** MinIO / static credentials: no session token — provider returns AwsBasicCredentials. */
+  @Test
+  public void resolveCredentials_withNullOrEmptySessionToken_returnsAwsBasicCredentials() {
+    Configuration conf = newTableBasedConf("unity-catalog-table");
+    conf.set(UCHadoopConf.S3A_INIT_ACCESS_KEY, "minio-access");
+    conf.set(UCHadoopConf.S3A_INIT_SECRET_KEY, "minio-secret");
+    // Do not set S3A_INIT_SESSION_TOKEN so it is null (MinIO / static creds)
+    conf.setLong(UCHadoopConf.S3A_INIT_CRED_EXPIRED_TIME, Long.MAX_VALUE);
+
+    AwsVendedTokenProvider provider =
+        createTestProvider(conf, Mockito.mock(TemporaryCredentialsApi.class));
+    software.amazon.awssdk.auth.credentials.AwsCredentials cred = provider.resolveCredentials();
+
+    assertThat(cred).isInstanceOf(AwsBasicCredentials.class);
+    assertThat(cred.accessKeyId()).isEqualTo("minio-access");
+    assertThat(cred.secretAccessKey()).isEqualTo("minio-secret");
   }
 
   @Test

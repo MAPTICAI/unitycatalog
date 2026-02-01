@@ -107,15 +107,21 @@ public class TableCli {
           FileOperations.toStandardizedURIString(
               json.getString(CliParams.STORAGE_LOCATION.getServerParam()));
       createTable.setStorageLocation(storageLocation);
-      // Currently generateTemporaryPathCredentials doesn't quite work yet due to lack of proper
-      // authorization in its implementation. So this step has to be skipped and only local dir can
-      // work. For details please check https://github.com/unitycatalog/unitycatalog/issues/1160
-      temporaryCredentials = null;
-      // temporaryCredentials =
-      //     temporaryCredentialsApi.generateTemporaryPathCredentials(
-      //         new GenerateTemporaryPathCredential()
-      //             .url(storageLocation)
-      //             .operation(PathOperation.PATH_CREATE_TABLE));
+      temporaryCredentials =
+          temporaryCredentialsApi.generateTemporaryPathCredentials(
+              new GenerateTemporaryPathCredential()
+                  .url(storageLocation)
+                  .operation(PathOperation.PATH_CREATE_TABLE));
+      // S3/MinIO requires credentials from UC; fail fast with clear message if missing
+      if (storageLocation.startsWith("s3://")
+          && (temporaryCredentials == null
+              || temporaryCredentials.getAwsTempCredentials() == null)) {
+        throw new CliException(
+            "No credentials returned for S3 path. Ensure (1) UC server has s3.bucketPath.* and "
+                + "credentials in server.properties for this bucket, (2) server image is rebuilt "
+                + "with MinIO/static credential support if using MinIO, (3) for MinIO set "
+                + "UC_S3_ENDPOINT (e.g. http://localhost:9001).");
+      }
     } else if (createTable.getTableType() == TableType.MANAGED) {
       // handle Delta managed tables
       if (json.has(CliParams.STORAGE_LOCATION.getServerParam())) {

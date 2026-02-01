@@ -91,15 +91,44 @@ public class DeltaKernelUtils {
       throw new IllegalArgumentException("URI scheme is missing");
     }
     if (scheme.equals(Constants.URI_SCHEME_S3)) {
+      if (temporaryCredentials == null) {
+        throw new IllegalArgumentException(
+            "Temporary credentials are required for S3 but were null. "
+                + "Rebuild the CLI (./build/sbt examples/cli/package) and ensure the UC server "
+                + "is configured for S3/MinIO (s3.bucketPath.*, s3.accessKey.*, s3.secretKey.*, "
+                + "and for MinIO: s3.endpoint.*, s3.pathStyleAccess.*).");
+      }
       AwsCredentials awsTempCredentials = temporaryCredentials.getAwsTempCredentials();
       if (awsTempCredentials == null) {
-        throw new IllegalArgumentException("AWS temporary credentials are missing");
+        throw new IllegalArgumentException(
+            "AWS temporary credentials are missing in server response. "
+                + "Check UC server has s3.* config for this bucket and is rebuilt with "
+                + "MinIO/static credential support if using MinIO.");
       }
       conf.set("fs.s3a.access.key", awsTempCredentials.getAccessKeyId());
       conf.set("fs.s3a.secret.key", awsTempCredentials.getSecretAccessKey());
-      conf.set("fs.s3a.session.token", awsTempCredentials.getSessionToken());
+      String sessionToken = awsTempCredentials.getSessionToken();
+      conf.set("fs.s3a.session.token", sessionToken != null ? sessionToken : "");
       conf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
       conf.set("fs.s3a.path.style.access", "true");
+      // MinIO / S3-compatible: use endpoint_url from server response, else UC_S3_ENDPOINT env
+      String customEndpoint =
+          temporaryCredentials.getEndpointUrl() != null
+              ? temporaryCredentials.getEndpointUrl()
+              : System.getenv("UC_S3_ENDPOINT");
+      if (customEndpoint != null && !customEndpoint.isBlank()) {
+        // Server in Docker may return host.docker.internal; CLI on host must use localhost
+        if (customEndpoint.contains("host.docker.internal")) {
+          customEndpoint = customEndpoint.replace("host.docker.internal", "localhost");
+        }
+        conf.set("fs.s3a.endpoint", customEndpoint);
+        // S3A requires a region; use UC_S3_REGION or default us-east-1 for MinIO
+        String region = System.getenv("UC_S3_REGION");
+        if (region == null || region.isBlank()) {
+          region = "us-east-1";
+        }
+        conf.set("fs.s3a.endpoint.region", region);
+      }
     } else if (scheme.equals(Constants.URI_SCHEME_FILE)) {
       conf.set("fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem");
     } else {

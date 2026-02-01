@@ -6,6 +6,7 @@ import io.unitycatalog.server.model.AzureUserDelegationSAS;
 import io.unitycatalog.server.model.GcpOauthToken;
 import io.unitycatalog.server.model.TemporaryCredentials;
 import io.unitycatalog.server.service.credential.aws.AwsCredentialVendor;
+import io.unitycatalog.server.service.credential.aws.S3StorageConfig;
 import io.unitycatalog.server.service.credential.azure.AzureCredential;
 import io.unitycatalog.server.service.credential.azure.AzureCredentialVendor;
 import io.unitycatalog.server.service.credential.gcp.GcpCredentialVendor;
@@ -73,6 +74,15 @@ public class CloudCredentialVendor {
     if (awsSessionCredentials.expiration() != null) {
       temporaryCredentials.expirationTime(awsSessionCredentials.expiration().toEpochMilli());
     }
+
+    // S3-compatible storage (e.g. MinIO): include endpoint URL so clients can connect without
+    // extra configuration.
+    awsCredentialVendor
+        .getS3StorageConfigForContext(context)
+        .map(S3StorageConfig::getEndpoint)
+        .filter(e -> e != null && !e.isBlank())
+        .ifPresent(temporaryCredentials::endpointUrl);
+
     return temporaryCredentials;
   }
 }

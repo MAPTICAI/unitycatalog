@@ -35,6 +35,7 @@ class UCSingleCatalog
   private[this] var uri: URI = null
   private[this] var tokenProvider: TokenProvider = null
   private[this] var renewCredEnabled: Boolean = false
+  private[this] var s3EndpointOverride: Option[String] = None
   private[this] var apiClient: ApiClient = null;
   private[this] var temporaryCredentialsApi: TemporaryCredentialsApi = null
   private[this] var tablesApi: TablesApi = null
@@ -50,12 +51,13 @@ class UCSingleCatalog
     renewCredEnabled = OptionsUtil.getBoolean(options,
       OptionsUtil.RENEW_CREDENTIAL_ENABLED,
       OptionsUtil.DEFAULT_RENEW_CREDENTIAL_ENABLED)
+    s3EndpointOverride = Option(options.get(OptionsUtil.S3_ENDPOINT)).filter(s => s != null && s.nonEmpty)
 
     apiClient = ApiClientFactory.createApiClient(
       JitterDelayRetryPolicy.builder().build(),uri, tokenProvider)
     temporaryCredentialsApi = new TemporaryCredentialsApi(apiClient)
     tablesApi = new TablesApi(apiClient)
-    val proxy = new UCProxy(uri, tokenProvider, renewCredEnabled, apiClient, tablesApi,
+    val proxy = new UCProxy(uri, tokenProvider, renewCredEnabled, s3EndpointOverride, apiClient, tablesApi,
       temporaryCredentialsApi)
     proxy.initialize(name, options)
     if (UCSingleCatalog.LOAD_DELTA_CATALOG.get()) {
@@ -159,6 +161,7 @@ class UCSingleCatalog
         stagingTableId,
         TableOperation.READ_WRITE,
         temporaryCredentials,
+        s3EndpointOverride.orNull,
       )
       UCSingleCatalog.setCredentialProps(newProps, credentialProps)
 
@@ -178,7 +181,9 @@ class UCSingleCatalog
         tokenProvider,
         location,
         PathOperation.PATH_CREATE_TABLE,
-        cred)
+        cred,
+        s3EndpointOverride.orNull,
+      )
 
       UCSingleCatalog.setCredentialProps(newProps, credentialProps)
       delegate.createTable(ident, columns, partitions, newProps)
@@ -279,6 +284,7 @@ private class UCProxy(
     uri: URI,
     tokenProvider: TokenProvider,
     renewCredEnabled: Boolean,
+    s3EndpointOverride: Option[String],
     apiClient: ApiClient,
     tablesApi: TablesApi,
     temporaryCredentialsApi: TemporaryCredentialsApi) extends TableCatalog with SupportsNamespaces {
@@ -356,6 +362,7 @@ private class UCProxy(
       tableId,
       tableOp,
       temporaryCredentials,
+      s3EndpointOverride.orNull,
     )
 
     val sparkTable = CatalogTable(

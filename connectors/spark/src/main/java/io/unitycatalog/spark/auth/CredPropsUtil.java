@@ -15,6 +15,7 @@ import io.unitycatalog.spark.UCHadoopConf;
 import io.unitycatalog.spark.auth.storage.AbfsVendedTokenProvider;
 import io.unitycatalog.spark.auth.storage.AwsVendedTokenProvider;
 import io.unitycatalog.spark.auth.storage.GcsVendedTokenProvider;
+import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.UUID;
 import org.sparkproject.guava.base.Preconditions;
@@ -27,7 +28,9 @@ public class CredPropsUtil {
     private final ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
 
     public T set(String key, String value) {
-      builder.put(key, value);
+      if (value != null) {
+        builder.put(key, value);
+      }
       return self();
     }
 
@@ -41,7 +44,12 @@ public class CredPropsUtil {
       // implementation. So let's add the prefix here.
       tokenProvider
           .configs()
-          .forEach((key, value) -> builder.put(UCHadoopConf.UC_AUTH_PREFIX + key, value));
+          .forEach(
+              (key, value) -> {
+                if (value != null) {
+                  builder.put(UCHadoopConf.UC_AUTH_PREFIX + key, value);
+                }
+              });
       return self();
     }
 
@@ -131,17 +139,23 @@ public class CredPropsUtil {
     }
   }
 
-  private static Map<String, String> s3FixedCredProps(TemporaryCredentials tempCreds) {
+  private static Map<String, String> s3FixedCredProps(
+      TemporaryCredentials tempCreds, String s3EndpointOverride) {
     AwsCredentials awsCred = tempCreds.getAwsTempCredentials();
-    return new S3PropsBuilder()
-        .set("fs.s3a.access.key", awsCred.getAccessKeyId())
-        .set("fs.s3a.secret.key", awsCred.getSecretAccessKey())
-        .set("fs.s3a.session.token", awsCred.getSessionToken())
-        .build();
+    S3PropsBuilder builder =
+        new S3PropsBuilder()
+            .set("fs.s3a.access.key", awsCred.getAccessKeyId())
+            .set("fs.s3a.secret.key", awsCred.getSecretAccessKey())
+            .set("fs.s3a.session.token", awsCred.getSessionToken());
+    applyS3Endpoint(builder, tempCreds, s3EndpointOverride);
+    return builder.build();
   }
 
   private static S3PropsBuilder s3TempCredPropsBuilder(
-      String uri, TokenProvider tokenProvider, TemporaryCredentials tempCreds) {
+      String uri,
+      TokenProvider tokenProvider,
+      TemporaryCredentials tempCreds,
+      String s3EndpointOverride) {
     AwsCredentials awsCred = tempCreds.getAwsTempCredentials();
     S3PropsBuilder builder =
         new S3PropsBuilder()
@@ -159,7 +173,50 @@ public class CredPropsUtil {
           UCHadoopConf.S3A_INIT_CRED_EXPIRED_TIME, String.valueOf(tempCreds.getExpirationTime()));
     }
 
+    applyS3Endpoint(builder, tempCreds, s3EndpointOverride);
     return builder;
+  }
+
+  /**
+   * Applies S3-compatible endpoint. When s3EndpointOverride is set (e.g.
+   * spark.sql.catalog.X.s3.endpoint in Kyuubi/FluxEngine), use it so Spark in K8s uses in-cluster
+   * MinIO URL instead of server's localhost. Otherwise uses endpoint from TemporaryCredentials;
+   * replaces host.docker.internal with localhost for Spark on host.
+   */
+  private static void applyS3Endpoint(
+      S3PropsBuilder builder, TemporaryCredentials tempCreds, String s3EndpointOverride) {
+    String endpointUrl =
+        (s3EndpointOverride != null && !s3EndpointOverride.isBlank())
+            ? s3EndpointOverride.trim()
+            : getEndpointUrlFromTempCreds(tempCreds);
+    if (endpointUrl == null || endpointUrl.isBlank()) {
+      return;
+    }
+    if (endpointUrl.contains("host.docker.internal")) {
+      endpointUrl = endpointUrl.replace("host.docker.internal", "localhost");
+    }
+    builder.set("fs.s3a.endpoint", endpointUrl);
+    builder.set("fs.s3a.endpoint.region", "us-east-1");
+  }
+
+  /**
+   * Gets endpoint URL from TemporaryCredentials via reflection so the connector is compatible with
+   * client JARs that don't have getEndpointUrl() (e.g. official release before endpoint_url).
+   */
+  private static String getEndpointUrlFromTempCreds(TemporaryCredentials tempCreds) {
+    try {
+      Method getEndpointUrl = TemporaryCredentials.class.getMethod("getEndpointUrl");
+      Object result = getEndpointUrl.invoke(tempCreds);
+      return result != null ? result.toString() : null;
+    } catch (NoSuchMethodException | SecurityException e) {
+      return null;
+    } catch (Exception e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof NoSuchMethodError) {
+        return null;
+      }
+      throw new RuntimeException(e);
+    }
   }
 
   private static Map<String, String> s3TableTempCredProps(
@@ -167,8 +224,9 @@ public class CredPropsUtil {
       TokenProvider tokenProvider,
       String tableId,
       TableOperation tableOp,
-      TemporaryCredentials tempCreds) {
-    return s3TempCredPropsBuilder(uri, tokenProvider, tempCreds)
+      TemporaryCredentials tempCreds,
+      String s3EndpointOverride) {
+    return s3TempCredPropsBuilder(uri, tokenProvider, tempCreds, s3EndpointOverride)
         .credentialType(UCHadoopConf.UC_CREDENTIALS_TYPE_TABLE_VALUE)
         .tableId(tableId)
         .tableOperation(tableOp)
@@ -180,8 +238,9 @@ public class CredPropsUtil {
       TokenProvider tokenProvider,
       String path,
       PathOperation pathOp,
-      TemporaryCredentials tempCreds) {
-    return s3TempCredPropsBuilder(uri, tokenProvider, tempCreds)
+      TemporaryCredentials tempCreds,
+      String s3EndpointOverride) {
+    return s3TempCredPropsBuilder(uri, tokenProvider, tempCreds, s3EndpointOverride)
         .credentialType(UCHadoopConf.UC_CREDENTIALS_TYPE_PATH_VALUE)
         .path(path)
         .pathOperation(pathOp)
@@ -307,13 +366,15 @@ public class CredPropsUtil {
       TokenProvider tokenProvider,
       String tableId,
       TableOperation tableOp,
-      TemporaryCredentials tempCreds) {
+      TemporaryCredentials tempCreds,
+      String s3EndpointOverride) {
     switch (scheme) {
       case "s3":
         if (renewCredEnabled) {
-          return s3TableTempCredProps(uri, tokenProvider, tableId, tableOp, tempCreds);
+          return s3TableTempCredProps(
+              uri, tokenProvider, tableId, tableOp, tempCreds, s3EndpointOverride);
         } else {
-          return s3FixedCredProps(tempCreds);
+          return s3FixedCredProps(tempCreds, s3EndpointOverride);
         }
       case "gs":
         if (renewCredEnabled) {
@@ -340,13 +401,15 @@ public class CredPropsUtil {
       TokenProvider tokenProvider,
       String path,
       PathOperation pathOp,
-      TemporaryCredentials tempCreds) {
+      TemporaryCredentials tempCreds,
+      String s3EndpointOverride) {
     switch (scheme) {
       case "s3":
         if (renewCredEnabled) {
-          return s3PathTempCredProps(uri, tokenProvider, path, pathOp, tempCreds);
+          return s3PathTempCredProps(
+              uri, tokenProvider, path, pathOp, tempCreds, s3EndpointOverride);
         } else {
-          return s3FixedCredProps(tempCreds);
+          return s3FixedCredProps(tempCreds, s3EndpointOverride);
         }
       case "gs":
         if (renewCredEnabled) {

@@ -70,6 +70,23 @@ To have Unity Catalog work with cloud object storage as the storage location for
     gcs.jsonKeyFilePath.0=/path/to/<SECRET>/gcp-key-uc-testing.json
     ```
 
+=== "MinIO (S3-compatible)"
+
+    Configure `etc/conf/server.properties` with MinIO endpoint, bucket, and static credentials.
+    Then when launching Spark, set `spark.hadoop.fs.s3a.endpoint` (see "MinIO" below).
+
+    ```sh
+    storage-root.models=s3://<BUCKET>/uc-models
+    storage-root.tables=s3://<BUCKET>/uc-tables
+    s3.bucketPath.0=s3://<BUCKET>
+    s3.region.0=us-east-1
+    s3.awsRoleArn.0=
+    s3.accessKey.0=<MINIO_ACCESS_KEY>
+    s3.secretKey.0=<MINIO_SECRET_KEY>
+    s3.endpoint.0=http://<MINIO_HOST>:<PORT>
+    s3.pathStyleAccess.0=true
+    ```
+
 ### [Optional] Restart Unity Catalog Server
 
 If the UC Server is already started, please restart it to account for the cloud storage server properties.

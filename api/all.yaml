@@ -2641,6 +2641,11 @@ components:
             The API client is advised to cache the credential given this expiration time.
           type: integer
           format: int64
+        endpoint_url:
+          description: |
+            Optional custom endpoint URL for S3-compatible storage (e.g. MinIO).
+            When set, clients should use this URL instead of the default AWS S3 endpoint.
+          type: string
     PathOperation:
       enum:
         - UNKNOWN_PATH_OPERATION

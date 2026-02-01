@@ -311,10 +311,20 @@ public class ServerProperties {
       String secretKey = getProperty("s3.secretKey." + i);
       String sessionToken = getProperty("s3.sessionToken." + i);
       String credentialsGenerator = getProperty("s3.credentialsGenerator." + i);
-      if ((bucketPath == null || region == null || awsRoleArn == null)
-          && (accessKey == null || secretKey == null || sessionToken == null)) {
+      String endpoint = getProperty("s3.endpoint." + i);
+      String pathStyleAccessStr = getProperty("s3.pathStyleAccess." + i);
+      // Need bucketPath and region to identify config; need at least one credential source
+      boolean hasBucketAndRegion =
+          bucketPath != null && !bucketPath.isEmpty() && region != null && !region.isEmpty();
+      boolean hasStaticCreds =
+          accessKey != null && !accessKey.isEmpty() && secretKey != null && !secretKey.isEmpty();
+      boolean hasSessionToken = sessionToken != null && !sessionToken.isEmpty();
+      boolean hasRoleArn = awsRoleArn != null && !awsRoleArn.isEmpty();
+      if (!hasBucketAndRegion || (!hasStaticCreds && !hasSessionToken && !hasRoleArn)) {
         break;
       }
+      Boolean pathStyleAccess =
+          pathStyleAccessStr != null && Boolean.parseBoolean(pathStyleAccessStr);
       S3StorageConfig s3StorageConfig =
           S3StorageConfig.builder()
               .bucketPath(bucketPath)
@@ -324,6 +334,8 @@ public class ServerProperties {
               .secretKey(secretKey)
               .sessionToken(sessionToken)
               .credentialsGenerator(credentialsGenerator)
+              .endpoint(endpoint)
+              .pathStyleAccess(pathStyleAccess)
               .build();
       s3BucketConfigMap.put(NormalizedURL.from(bucketPath), s3StorageConfig);
       i++;

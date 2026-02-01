@@ -4,8 +4,14 @@ services:
 
   server:
     image: unitycatalog/unitycatalog:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    # Reach host's port-forward (e.g. MinIO at localhost:9001) from inside the container
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - type: bind
         source: ./etc/conf
