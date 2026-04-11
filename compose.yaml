@@ -3,7 +3,7 @@ name: unitycatalog
 services:
 
   server:
-    image: unitycatalog/unitycatalog:latest
+    # image: unitycatalog/unitycatalog:latest
     build:
       context: .
       dockerfile: Dockerfile
