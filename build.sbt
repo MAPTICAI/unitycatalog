@@ -335,6 +335,14 @@ lazy val server = (project in file("server"))
 
       "com.google.code.findbugs" % "jsr305" % "3.0.2",
       "com.h2database" %  "h2" % "2.2.224",
+      // PostgreSQL JDBC driver — required for the optional RDS-backed metadata
+      // store. UC reads `hibernate.properties` from disk; setting
+      // hibernate.connection.driver_class=org.postgresql.Driver +
+      // hibernate.connection.url=jdbc:postgresql://... switches the
+      // metadata DB from H2 file to PostgreSQL. The bootstrap CREATEs
+      // (~16 catalog/schema/table DAOs in HibernateConfigurator.java) are
+      // managed by hibernate.hbm2ddl.auto=update.
+      "org.postgresql" % "postgresql" % "42.7.4",
 
       "org.hibernate.orm" % "hibernate-core" % "6.5.0.Final",
 
