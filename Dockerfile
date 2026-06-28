@@ -55,6 +55,9 @@ chmod -R 770 $HOME/etc/
 chown -R $USER:$USER $HOME
 # chown the copied root-owned coursier cache to the runtime user so java -cp can load the jars
 chown -R $USER:$USER /root/.cache
+# /root defaults to mode 700 in alpine; the unitycatalog runtime user needs
+# traverse permission to reach /root/.cache/coursier/v1/.../armeria-*.jar etc.
+chmod 755 /root
 EOF
 
 USER $USER
