@@ -722,7 +722,8 @@ public class DeltaCommitRepository {
     NativeQuery<?> query =
         session.createNativeQuery(
             "DELETE FROM uc_delta_commits WHERE id IN "
-                + "(SELECT id FROM uc_delta_commits WHERE table_id = :tableId LIMIT :numCommitsPerBatch)");
+                + "(SELECT id FROM uc_delta_commits WHERE table_id = :tableId "
+                + "LIMIT :numCommitsPerBatch)");
     query.setParameter("tableId", tableId);
     query.setParameter("numCommitsPerBatch", NUM_COMMITS_PER_BATCH);
     return query.executeUpdate();
