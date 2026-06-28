@@ -374,6 +374,11 @@ lazy val server = (project in file("server"))
 
       "com.google.code.findbugs" % "jsr305" % "3.0.2",
       "com.h2database" %  "h2" % "2.2.224",
+      // PostgreSQL driver (optional RDS-backed metadata store; maptic EKS fork).
+      // Switch via hibernate.properties:
+      //   hibernate.connection.driver_class=org.postgresql.Driver
+      //   hibernate.connection.url=jdbc:postgresql://<rds-host>:5432/unity_catalog
+      "org.postgresql" % "postgresql" % "42.7.4",
 
       "org.hibernate.orm" % "hibernate-core" % "6.5.0.Final",
 
