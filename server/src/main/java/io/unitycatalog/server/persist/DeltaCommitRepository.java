@@ -694,9 +694,12 @@ public class DeltaCommitRepository {
    * @return the number of commits actually deleted in this batch
    */
   private static int deleteCommitsUpTo(Session session, UUID tableId, long upToCommitVersion) {
+    // PostgreSQL does not support DELETE ... LIMIT directly; use a subquery with IN.
     NativeQuery<?> query =
         session.createNativeQuery(
-            "DELETE FROM uc_delta_commits WHERE table_id = :tableId AND commit_version <= :upToCommitVersion LIMIT :numCommitsPerBatch");
+            "DELETE FROM uc_delta_commits WHERE id IN "
+                + "(SELECT id FROM uc_delta_commits WHERE table_id = :tableId "
+                + "AND commit_version <= :upToCommitVersion LIMIT :numCommitsPerBatch)");
     query.setParameter("tableId", tableId);
     query.setParameter("upToCommitVersion", upToCommitVersion);
     query.setParameter("numCommitsPerBatch", NUM_COMMITS_PER_BATCH);
@@ -715,9 +718,11 @@ public class DeltaCommitRepository {
    * @return the number of commits actually deleted in this batch
    */
   private static int deleteCommits(Session session, UUID tableId) {
+    // PostgreSQL does not support DELETE ... LIMIT directly; use a subquery with IN.
     NativeQuery<?> query =
         session.createNativeQuery(
-            "DELETE FROM uc_delta_commits WHERE table_id = :tableId LIMIT :numCommitsPerBatch");
+            "DELETE FROM uc_delta_commits WHERE id IN "
+                + "(SELECT id FROM uc_delta_commits WHERE table_id = :tableId LIMIT :numCommitsPerBatch)");
     query.setParameter("tableId", tableId);
     query.setParameter("numCommitsPerBatch", NUM_COMMITS_PER_BATCH);
     return query.executeUpdate();
