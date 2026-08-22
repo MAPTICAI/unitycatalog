@@ -111,8 +111,20 @@ public class AwsCredentialVendor {
       }
     }
 
-    if (config.getSessionToken() != null && !config.getSessionToken().isEmpty()) {
-      // if a session token was supplied, then we will just return static session credentials
+    // Static credentials (no STS) — chosen whenever accessKey + secretKey are
+    // configured, regardless of whether sessionToken is set. sessionToken, if
+    // present, is passed through and the SDK adds the x-amz-security-token
+    // header. If sessionToken is null, the SDK omits the header and the
+    // request is a plain SigV4 — this is the right shape for local MinIO
+    // and any other S3-compatible store that doesn't validate STS tokens.
+    //
+    // Previous behavior routed accessKey+secretKey-only configs through
+    // StsAwsCredentialGenerator, which tried to AssumeRole against AWS STS
+    // and failed for non-AWS setups (no STS endpoint).
+    if (config.getAccessKey() != null
+        && !config.getAccessKey().isEmpty()
+        && config.getSecretKey() != null
+        && !config.getSecretKey().isEmpty()) {
       return new AwsCredentialGenerator.StaticAwsCredentialGenerator(config);
     }
 
