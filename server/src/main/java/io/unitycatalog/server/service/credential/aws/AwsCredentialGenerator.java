@@ -47,11 +47,18 @@ public interface AwsCredentialGenerator {
 
     @Override
     public Credentials generate(CredentialContext ctx) {
-      return Credentials.builder()
-          .accessKeyId(accessKeyId)
-          .secretAccessKey(secretKey)
-          .sessionToken(sessionToken)
-          .build();
+      // STS Credentials.builder().build() calls Objects.requireNonNull on
+      // sessionToken — even when null is passed via the setter. So we must
+      // omit the sessionToken() call entirely when there's no session token.
+      // Skipping it makes the SDK produce a non-Session credential (plain
+      // SigV4, no x-amz-security-token header) — the right shape for local
+      // MinIO and any other S3-compatible store that ignores STS.
+      Credentials.Builder builder =
+          Credentials.builder().accessKeyId(accessKeyId).secretAccessKey(secretKey);
+      if (sessionToken != null && !sessionToken.isEmpty()) {
+        builder.sessionToken(sessionToken);
+      }
+      return builder.build();
     }
   }
 
