@@ -319,8 +319,14 @@ public class ServerProperties {
       String secretKey = getProperty("s3.secretKey." + i);
       String sessionToken = getProperty("s3.sessionToken." + i);
       String credentialGenerator = getProperty("s3.credentialGenerator." + i);
+      // Static-creds (non-STS) configs are valid with just accessKey+secretKey;
+      // sessionToken is only meaningful when paired with an STS session.
+      // The previous guard required sessionToken for the static path, which
+      // incorrectly rejected MinIO/local setups that have no STS at all
+      // (StaticAwsCredentialGenerator works fine without one — see
+      // AwsCredentialGenerator.StaticAwsCredentialGenerator).
       if ((bucketPath == null || region == null || awsRoleArn == null)
-          && (accessKey == null || secretKey == null || sessionToken == null)) {
+          && (accessKey == null || secretKey == null)) {
         break;
       }
       S3StorageConfig s3StorageConfig =
