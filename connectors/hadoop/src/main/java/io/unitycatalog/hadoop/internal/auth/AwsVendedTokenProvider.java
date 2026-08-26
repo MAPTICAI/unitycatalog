@@ -3,6 +3,7 @@ package io.unitycatalog.hadoop.internal.auth;
 import io.unitycatalog.hadoop.internal.UCHadoopConfConstants;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.util.Preconditions;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
@@ -52,10 +53,26 @@ public class AwsVendedTokenProvider extends GenericCredentialProvider
     Preconditions.checkNotNull(
         awsTempCred, "AWS temp credential of generic credentials cannot be null");
 
-    return AwsSessionCredentials.builder()
-        .accessKeyId(awsTempCred.getAccessKeyId())
-        .secretAccessKey(awsTempCred.getSecretAccessKey())
-        .sessionToken(awsTempCred.getSessionToken())
-        .build();
+    String sessionToken = awsTempCred.getSessionToken();
+    Preconditions.checkNotNull(
+        awsTempCred.getAccessKeyId(), "Access key of AWS temp credential cannot be null");
+    Preconditions.checkNotNull(
+        awsTempCred.getSecretAccessKey(), "Secret key of AWS temp credential cannot be null");
+
+    // When the UC server returns no session token (e.g. local MinIO via
+    // StaticAwsCredentialGenerator), use AwsBasicCredentials so we don't
+    // emit x-amz-security-token headers — plain SigV4 is the right shape
+    // for S3-compatible stores that ignore STS. With a session token, use
+    // AwsSessionCredentials so the SDK adds the header.
+    if (sessionToken != null && !sessionToken.isEmpty()) {
+      return AwsSessionCredentials.builder()
+          .accessKeyId(awsTempCred.getAccessKeyId())
+          .secretAccessKey(awsTempCred.getSecretAccessKey())
+          .sessionToken(sessionToken)
+          .build();
+    } else {
+      return AwsBasicCredentials.create(
+          awsTempCred.getAccessKeyId(), awsTempCred.getSecretAccessKey());
+    }
   }
 }
