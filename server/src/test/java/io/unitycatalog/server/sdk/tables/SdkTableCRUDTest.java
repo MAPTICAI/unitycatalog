@@ -23,9 +23,11 @@ import io.unitycatalog.server.exception.ErrorCode;
 import io.unitycatalog.server.persist.dao.StagingTableDAO;
 import io.unitycatalog.server.sdk.catalog.SdkCatalogOperations;
 import io.unitycatalog.server.sdk.schema.SdkSchemaOperations;
+import io.unitycatalog.server.service.delta.DeltaConsts.TableProperties;
 import io.unitycatalog.server.utils.TestUtils;
 import java.nio.file.Files;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.hibernate.Session;
@@ -38,7 +40,9 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
           new ColumnInfo()
               .name("test_column")
               .typeText("INTEGER")
-              .typeJson("{\"type\": \"integer\"}")
+              .typeJson(
+                  "{\"name\":\"test_column\",\"type\":\"integer\","
+                      + "\"nullable\":true,\"metadata\":{}}")
               .typeName(ColumnTypeName.INT)
               .position(0)
               .nullable(true));
@@ -112,6 +116,45 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
     assertThat(nextPageResp.getTables()).hasSize(1);
   }
 
+  @Test
+  public void testCreateTableRejectsInvalidColumnTypeJson() throws Exception {
+    assertCreateTableWithInvalidTypeJson("missing_type_json", null);
+    assertCreateTableWithInvalidTypeJson("invalid_type_json", "not json at all");
+    assertCreateTableWithInvalidTypeJson("short_type_json", "\"integer\"");
+    assertCreateTableWithInvalidTypeJson(
+        "missing_metadata_type_json",
+        "{\"name\":\"bad_column\",\"type\":\"integer\",\"nullable\":true}");
+  }
+
+  private void assertCreateTableWithInvalidTypeJson(String tableName, String typeJson)
+      throws Exception {
+    CreateTable createTableRequest =
+        new CreateTable()
+            .name(tableName)
+            .catalogName(TestUtils.CATALOG_NAME)
+            .schemaName(TestUtils.SCHEMA_NAME)
+            .columns(
+                List.of(
+                    new ColumnInfo()
+                        .name("bad_column")
+                        .typeText("INTEGER")
+                        .typeJson(typeJson)
+                        .typeName(ColumnTypeName.INT)
+                        .position(0)
+                        .nullable(true)))
+            .tableType(TableType.EXTERNAL)
+            .dataSourceFormat(DataSourceFormat.DELTA)
+            .storageLocation(Files.createTempDirectory(testDirectoryRoot, "table").toString());
+
+    assertThatExceptionOfType(ApiException.class)
+        .isThrownBy(() -> localTablesApi.createTable(createTableRequest))
+        .satisfies(
+            ex ->
+                assertThat(ex.getCode())
+                    .isEqualTo(ErrorCode.INVALID_ARGUMENT.getHttpStatus().code()))
+        .withMessageContaining("Invalid type_json for column bad_column");
+  }
+
   /**
    * Test the complete flow of creating a staging table and then creating a managed table using that
    * staging table's location.
@@ -138,7 +181,7 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
     assertThat(stagingTableInfo.getId()).isNotNull();
     assertThat(stagingTableInfo.getStagingLocation()).isNotNull();
     assertThat(stagingTableInfo.getStagingLocation())
-        .isEqualTo(tableStorageRoot + "/tables/" + stagingTableInfo.getId());
+        .isEqualTo(tableStorageRoot + "/__unitystorage/tables/" + stagingTableInfo.getId());
 
     // Step 2: Create a managed table that's not DELTA
     CreateTable createTableRequestNotDelta =
@@ -170,6 +213,7 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
             .tableType(TableType.MANAGED)
             .dataSourceFormat(DataSourceFormat.DELTA)
             .storageLocation(stagingTableInfo.getStagingLocation())
+            .properties(Map.of(TableProperties.UC_TABLE_ID, stagingTableInfo.getId()))
             .comment("Table created from staging location");
 
     TableInfo tableInfo = localTablesApi.createTable(createTableRequest);
@@ -187,7 +231,7 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
     assertThat(commitedStagingTableDAO).isNotNull();
     assertThat(commitedStagingTableDAO.getStagingLocation()).isNotNull();
     assertThat(commitedStagingTableDAO.getStagingLocation())
-        .isEqualTo(tableStorageRoot + "/tables/" + stagingTableInfo.getId());
+        .isEqualTo(tableStorageRoot + "/__unitystorage/tables/" + stagingTableInfo.getId());
     assertThat(commitedStagingTableDAO.isStageCommitted()).isEqualTo(true);
 
     // Clean up
@@ -246,7 +290,8 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
             .columns(columns)
             .tableType(TableType.MANAGED)
             .dataSourceFormat(DataSourceFormat.DELTA)
-            .storageLocation(fakeStagingLocation);
+            .storageLocation(fakeStagingLocation)
+            .properties(Map.of(TableProperties.UC_TABLE_ID, stagingTableInfo.getId()));
 
     // This should fail with NOT_FOUND
     assertThatExceptionOfType(ApiException.class)
@@ -305,19 +350,21 @@ public class SdkTableCRUDTest extends BaseTableCRUDTest {
             .columns(columns)
             .tableType(TableType.MANAGED)
             .dataSourceFormat(DataSourceFormat.DELTA)
-            .storageLocation(stagingTableInfo.getStagingLocation());
+            .storageLocation(stagingTableInfo.getStagingLocation())
+            .properties(Map.of(TableProperties.UC_TABLE_ID, stagingTableInfo.getId()));
     TableInfo tableInfo = localTablesApi.createTable(createTableRequest);
     assertThat(tableInfo).isNotNull();
     assertThat(tableInfo.getStorageLocation()).isEqualTo(stagingTableInfo.getStagingLocation());
     assertThat(tableInfo.getTableId()).isEqualTo(stagingTableInfo.getId());
 
-    // Create a 3rd staging table with the same name, and now it fails with ALREADY_EXISTS because
-    // the table has already been created using that name.
+    // Create a 3rd staging table with the same name, and now it fails with TABLE_ALREADY_EXISTS
+    // because the table has already been created using that name.
     assertThatExceptionOfType(ApiException.class)
         .isThrownBy(() -> localTablesApi.createStagingTable(createStagingTableRequest))
         .satisfies(
             ex ->
-                assertThat(ex.getCode()).isEqualTo(ErrorCode.ALREADY_EXISTS.getHttpStatus().code()))
+                assertThat(ex.getCode())
+                    .isEqualTo(ErrorCode.TABLE_ALREADY_EXISTS.getHttpStatus().code()))
         .withMessageContaining("already exists");
   }
 

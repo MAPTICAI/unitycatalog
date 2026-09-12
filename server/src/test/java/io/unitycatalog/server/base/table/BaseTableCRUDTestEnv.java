@@ -43,7 +43,9 @@ public abstract class BaseTableCRUDTestEnv extends BaseCRUDTest {
           new ColumnInfo()
               .name("as_int")
               .typeText("INTEGER")
-              .typeJson("{\"type\": \"integer\"}")
+              .typeJson(
+                  "{\"name\":\"as_int\",\"type\":\"integer\","
+                      + "\"nullable\":true,\"metadata\":{}}")
               .typeName(ColumnTypeName.INT)
               .position(0)
               .comment("Integer column")
@@ -51,7 +53,9 @@ public abstract class BaseTableCRUDTestEnv extends BaseCRUDTest {
           new ColumnInfo()
               .name("as_string")
               .typeText("VARCHAR(255)")
-              .typeJson("{\"type\": \"string\", \"length\": \"255\"}")
+              .typeJson(
+                  "{\"name\":\"as_string\",\"type\":\"string\","
+                      + "\"nullable\":true,\"metadata\":{}}")
               .typeName(ColumnTypeName.STRING)
               .position(1)
               .comment("String column")
@@ -104,7 +108,7 @@ public abstract class BaseTableCRUDTestEnv extends BaseCRUDTest {
     assertThat(managedTable.getCatalogName()).isEqualTo(TestUtils.CATALOG_NAME);
     assertThat(managedTable.getSchemaName()).isEqualTo(TestUtils.SCHEMA_NAME);
     assertThat(managedTable.getStorageLocation())
-        .isEqualTo(tableStorageRoot + "/tables/" + managedTable.getTableId());
+        .isEqualTo(tableStorageRoot + "/__unitystorage/tables/" + managedTable.getTableId());
     assertThat(managedTable.getTableType()).isEqualTo(TableType.MANAGED);
     assertThat(managedTable.getDataSourceFormat()).isEqualTo(DataSourceFormat.DELTA);
     assertThat(managedTable.getCreatedAt()).isNotNull();

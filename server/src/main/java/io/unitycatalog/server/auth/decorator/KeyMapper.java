@@ -139,8 +139,8 @@ public class KeyMapper {
     this.credentialRepository = repositories.getCredentialRepository();
   }
 
-  public Map<SecurableType, Object> mapResourceKeys(Map<SecurableType, Object> resourceKeys) {
-    Map<SecurableType, Object> resourceIds = new HashMap<>();
+  public Map<SecurableType, UUID> mapResourceKeys(Map<SecurableType, Object> resourceKeys) {
+    Map<SecurableType, UUID> resourceIds = new HashMap<>();
 
     if (resourceKeys.containsKey(CATALOG)
         && resourceKeys.containsKey(SCHEMA)
@@ -305,8 +305,10 @@ public class KeyMapper {
     // External locations can be referenced by name (string) or UUID or path
     if (resourceKeys.containsKey(EXTERNAL_LOCATION)) {
       Object resourceObject = resourceKeys.get(EXTERNAL_LOCATION);
-      if (resourceObject instanceof UUID) {
-        resourceIds.put(EXTERNAL_LOCATION, resourceObject);
+      if (resourceObject == null) {
+        // External location is explicitly null (not set), don't add to resourceIds
+      } else if (resourceObject instanceof UUID) {
+        resourceIds.put(EXTERNAL_LOCATION, (UUID) resourceObject);
       } else {
         String nameOrPath = (String) resourceObject;
         if (nameOrPath.contains("/")) {
@@ -333,7 +335,7 @@ public class KeyMapper {
       if (resourceObject == null) {
         // Credential is explicitly null (e.g., not being updated), don't add to resourceIds
       } else if (resourceObject instanceof UUID) {
-        resourceIds.put(CREDENTIAL, resourceObject);
+        resourceIds.put(CREDENTIAL, (UUID) resourceObject);
       } else {
         String name = (String) resourceObject;
         String credentialId = credentialRepository.getCredential(name).getId();

@@ -17,12 +17,14 @@ import io.unitycatalog.server.model.VolumeInfo;
 import io.unitycatalog.server.persist.dao.CatalogInfoDAO;
 import io.unitycatalog.server.persist.dao.PropertyDAO;
 import io.unitycatalog.server.persist.dao.SchemaInfoDAO;
+import io.unitycatalog.server.persist.utils.ExternalLocationUtils;
 import io.unitycatalog.server.persist.utils.PagedListingHelper;
 import io.unitycatalog.server.persist.utils.RepositoryUtils;
 import io.unitycatalog.server.persist.utils.RepositoryUtils.CatalogAndSchemaNames;
 import io.unitycatalog.server.persist.utils.TransactionManager;
 import io.unitycatalog.server.utils.Constants;
 import io.unitycatalog.server.utils.IdentityUtils;
+import io.unitycatalog.server.utils.NormalizedURL;
 import io.unitycatalog.server.utils.ValidationUtils;
 import java.util.ArrayList;
 import java.util.Date;
@@ -56,9 +58,10 @@ public class SchemaRepository {
                   .getCatalogDaoOrThrow(session, createSchema.getCatalogName());
           validateSchemaNotExistInCatalog(session, catalogDAO, createSchema.getName());
           Long createTime = System.currentTimeMillis();
+          UUID schemaId = UUID.randomUUID();
           SchemaInfo schemaInfo =
               new SchemaInfo()
-                  .schemaId(UUID.randomUUID().toString())
+                  .schemaId(schemaId.toString())
                   .name(createSchema.getName())
                   .catalogName(createSchema.getCatalogName())
                   .comment(createSchema.getComment())
@@ -68,6 +71,16 @@ public class SchemaRepository {
                   .updatedAt(createTime)
                   .updatedBy(callerId)
                   .properties(createSchema.getProperties());
+          NormalizedURL storageRoot = NormalizedURL.from(createSchema.getStorageRoot());
+          if (storageRoot != null) {
+            // storageRoot, if set, is already authorized as a valid external location by
+            // SchemaService.
+            ExternalLocationUtils.validateNotSameOrUnderManagedStoragePrefix(storageRoot);
+            NormalizedURL storageLocation =
+                ExternalLocationUtils.getManagedLocationForSchema(storageRoot, schemaId);
+            schemaInfo.setStorageRoot(storageRoot.toString());
+            schemaInfo.setStorageLocation(storageLocation.toString());
+          }
           SchemaInfoDAO schemaInfoDAO = SchemaInfoDAO.from(schemaInfo);
           schemaInfoDAO.setCatalogId(catalogDAO.getId());
           PropertyDAO.from(schemaInfo.getProperties(), schemaInfoDAO.getId(), Constants.SCHEMA)
@@ -99,7 +112,8 @@ public class SchemaRepository {
         .orElseThrow(
             () ->
                 new BaseException(
-                    ErrorCode.NOT_FOUND, "Schema not found: " + catalogName + "." + schemaName));
+                    ErrorCode.SCHEMA_NOT_FOUND,
+                    "Schema not found: " + catalogName + "." + schemaName));
   }
 
   public SchemaInfoDAO getSchemaDaoOrThrow(Session session, String catalogName, String schemaName) {
@@ -110,6 +124,18 @@ public class SchemaRepository {
   public UUID getSchemaIdOrThrow(Session session, String catalogName, String schemaName) {
     SchemaInfoDAO schemaInfo = getSchemaDaoOrThrow(session, catalogName, schemaName);
     return schemaInfo.getId();
+  }
+
+  /**
+   * Returns the UUID of the named schema. Opens its own transaction, so callers that already have a
+   * {@code Session} should use {@link #getSchemaIdOrThrow(Session, String, String)} directly.
+   */
+  public UUID getSchemaIdOrThrow(String catalogName, String schemaName) {
+    return TransactionManager.executeWithTransaction(
+        sessionFactory,
+        session -> getSchemaIdOrThrow(session, catalogName, schemaName),
+        "Failed to get schema id",
+        /* readOnly = */ true);
   }
 
   private void validateSchemaNotExistInCatalog(
@@ -125,7 +151,7 @@ public class SchemaRepository {
         .ifPresent(
             schemaInfoDAO -> {
               throw new BaseException(
-                  ErrorCode.ALREADY_EXISTS, "Schema already exists: " + schemaName);
+                  ErrorCode.SCHEMA_ALREADY_EXISTS, "Schema already exists: " + schemaName);
             });
   }
 

@@ -2,10 +2,11 @@ package io.unitycatalog.spark.auth.storage;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 
+import io.unitycatalog.hadoop.internal.UCHadoopConfConstants;
+import io.unitycatalog.hadoop.internal.auth.AbfsVendedTokenProvider;
 import io.unitycatalog.server.service.credential.azure.ADLSStorageConfig;
 import io.unitycatalog.server.service.credential.azure.AzureCredential;
-import io.unitycatalog.server.service.credential.azure.AzureCredentialsGenerator;
-import io.unitycatalog.spark.UCHadoopConf;
+import io.unitycatalog.server.service.credential.azure.AzureCredentialGenerator;
 import java.util.Map;
 
 public class AbfsCredRenewITTest extends BaseCredRenewITTest {
@@ -19,7 +20,7 @@ public class AbfsCredRenewITTest extends BaseCredRenewITTest {
     serverProperties.put("adls.clientId.0", "clientId0");
     serverProperties.put("adls.clientSecret.0", "clientSecret0");
     // Customize the time based credential generator to issue a new credential every 30 sec.
-    serverProperties.put("adls.credentialsGenerator.0", AzureCredGenerator.class.getName());
+    serverProperties.put("adls.credentialGenerator.0", AzureCredGenerator.class.getName());
   }
 
   @Override
@@ -33,7 +34,7 @@ public class AbfsCredRenewITTest extends BaseCredRenewITTest {
   }
 
   public static class AzureCredGenerator extends TimeBasedCredGenerator<AzureCredential>
-      implements AzureCredentialsGenerator {
+      implements AzureCredentialGenerator {
     // Default constructor for AzureCredGenerator reflection.
     public AzureCredGenerator(ADLSStorageConfig ignore) {}
 
@@ -56,7 +57,7 @@ public class AbfsCredRenewITTest extends BaseCredRenewITTest {
 
     @Override
     protected AbfsVendedTokenProvider createProvider() {
-      String clazz = getConf().get(UCHadoopConf.FS_AZURE_SAS_TOKEN_PROVIDER_TYPE);
+      String clazz = getConf().get(UCHadoopConfConstants.FS_AZURE_SAS_TOKEN_PROVIDER_TYPE);
       assertThat(clazz).isEqualTo(AbfsVendedTokenProvider.class.getName());
 
       AbfsVendedTokenProvider provider = new AbfsVendedTokenProvider();

@@ -1,5 +1,7 @@
 package io.unitycatalog.server.persist;
 
+import static java.sql.Connection.TRANSACTION_REPEATABLE_READ;
+
 import io.unitycatalog.server.exception.BaseException;
 import io.unitycatalog.server.exception.ErrorCode;
 import io.unitycatalog.server.model.ColumnInfos;
@@ -16,12 +18,14 @@ import io.unitycatalog.server.persist.dao.DeltaCommitDAO;
 import io.unitycatalog.server.persist.dao.PropertyDAO;
 import io.unitycatalog.server.persist.dao.TableInfoDAO;
 import io.unitycatalog.server.persist.utils.TransactionManager;
+import io.unitycatalog.server.service.delta.DeltaUniformUtils;
+import io.unitycatalog.server.service.delta.UcManagedDeltaContract;
 import io.unitycatalog.server.utils.Constants;
 import io.unitycatalog.server.utils.IdentityUtils;
 import io.unitycatalog.server.utils.NormalizedURL;
 import io.unitycatalog.server.utils.ServerProperties;
-import io.unitycatalog.server.utils.TableProperties;
 import io.unitycatalog.server.utils.ValidationUtils;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -92,28 +96,57 @@ public class DeltaCommitRepository {
   }
 
   /**
-   * Retrieves all commits for a table in descending order by version up to NUM_COMMITS_PER_BATCH.
+   * Result of querying unbackfilled commits for a table.
+   *
+   * @param commits unbackfilled commits (descending version order, newest first)
+   * @param latestTableVersion the latest commit version (0 if no commits)
+   * @param oldestVersion the oldest commit version in the DB (used for pagination base)
    */
-  private List<DeltaCommitDAO> getAllCommitDAOsDesc(UUID tableId) {
-    return TransactionManager.executeWithTransaction(
-        sessionFactory,
-        session -> {
-          TableInfoDAO tableInfoDAO = session.get(TableInfoDAO.class, tableId);
-          if (tableInfoDAO == null) {
-            throw new BaseException(ErrorCode.NOT_FOUND, "Table not found: " + tableId);
-          }
-          validateTable(tableInfoDAO);
+  record CommitQueryResult(
+      List<DeltaCommitDAO> commits, long latestTableVersion, long oldestVersion) {}
 
-          Query<DeltaCommitDAO> query =
-              session.createQuery(
-                  "FROM DeltaCommitDAO WHERE tableId = :tableId ORDER BY commitVersion DESC",
-                  DeltaCommitDAO.class);
-          query.setParameter("tableId", tableId);
-          query.setMaxResults(NUM_COMMITS_PER_BATCH);
-          return query.list();
-        },
-        "Failed to get latest commits",
-        /* readOnly= */ true);
+  /**
+   * Query unbackfilled commits for a table within an existing session. Returns commits in
+   * descending version order (newest first) and the latest table version.
+   *
+   * <p>Handles empty tables (returns version 0) and fully backfilled tables (returns empty list
+   * with correct version).
+   */
+  CommitQueryResult getUnbackfilledCommits(Session session, UUID tableId) {
+    Query<DeltaCommitDAO> query =
+        session.createQuery(
+            "FROM DeltaCommitDAO WHERE tableId = :tableId ORDER BY commitVersion DESC",
+            DeltaCommitDAO.class);
+    query.setParameter("tableId", tableId);
+    query.setMaxResults(NUM_COMMITS_PER_BATCH);
+    List<DeltaCommitDAO> allDesc = query.list();
+
+    if (allDesc.isEmpty()) {
+      return new CommitQueryResult(List.of(), 0L, 0L);
+    }
+
+    int commitCount = allDesc.size();
+    if (commitCount > MAX_NUM_COMMITS_PER_TABLE) {
+      LOGGER.error(
+          "Table {} has {} commits, exceeds limit {}.",
+          tableId,
+          commitCount,
+          MAX_NUM_COMMITS_PER_TABLE);
+    }
+
+    DeltaCommitDAO newestCommit = allDesc.get(0);
+    long latestVersion = newestCommit.getCommitVersion();
+    long oldestVersion = allDesc.get(allDesc.size() - 1).getCommitVersion();
+    if (newestCommit.isBackfilledLatestCommit()) {
+      return new CommitQueryResult(List.of(), latestVersion, oldestVersion);
+    }
+
+    // Only the latest backfilled version is kept in the DB as a
+    // marker (isBackfilledLatestCommit=true). All other backfilled
+    // commits are deleted. Filter out this single marker.
+    List<DeltaCommitDAO> unbackfilled =
+        allDesc.stream().filter(c -> !c.isBackfilledLatestCommit()).toList();
+    return new CommitQueryResult(unbackfilled, latestVersion, oldestVersion);
   }
 
   /**
@@ -131,7 +164,7 @@ public class DeltaCommitRepository {
    * removed from the database. If the latest commit is marked as backfilled, this method returns an
    * empty commit list but still returns the correct latestTableVersion.
    *
-   * <p><b>Empty table behavior:</b> If the table has no commits yet, returns latestTableVersion=-1
+   * <p><b>Empty table behavior:</b> If the table has no commits yet, returns latestTableVersion=0
    * with an empty commit list.
    *
    * <p>The returned commits are ordered by version in descending order (newest first).
@@ -150,56 +183,38 @@ public class DeltaCommitRepository {
         endVersion.filter(x -> x < startVersion).isEmpty(),
         "end_version must be >=start_version if set");
 
-    List<DeltaCommitDAO> allCommitDAOsDesc = getAllCommitDAOsDesc(tableId);
-    int commitCount = allCommitDAOsDesc.size();
-    if (commitCount > MAX_NUM_COMMITS_PER_TABLE) {
-      // This should never occur. But this is recoverable and not fatal.
-      LOGGER.error(
-          "Table {} has {} commits, which exceeds the limit of {}.",
-          tableId,
-          commitCount,
-          MAX_NUM_COMMITS_PER_TABLE);
-    }
-    if (commitCount == 0) {
-      // No commit exist yet. Not even any backfilled one. That means the table has never sent any
-      // commit coordinated by UC.
-      return new DeltaGetCommitsResponse().latestTableVersion(-1L);
-    }
+    return TransactionManager.executeWithTransaction(
+        sessionFactory,
+        session -> {
+          // Validate table exists and is managed Delta
+          TableInfoDAO tableInfoDAO = session.get(TableInfoDAO.class, tableId);
+          if (tableInfoDAO == null) {
+            throw new BaseException(ErrorCode.TABLE_NOT_FOUND, "Table not found: " + tableId);
+          }
+          validateTable(tableInfoDAO);
 
-    // In case there's only one commit in database, firstCommitDAO and lastCommitDAO will be the
-    // same object.
-    DeltaCommitDAO firstCommitDAO = allCommitDAOsDesc.get(allCommitDAOsDesc.size() - 1);
-    DeltaCommitDAO lastCommitDAO = allCommitDAOsDesc.get(0);
-    assert firstCommitDAO.getCommitVersion() <= lastCommitDAO.getCommitVersion();
-    if (lastCommitDAO.isBackfilledLatestCommit()) {
-      // The last commit is already backfilled. Just return an empty list. No need to return any
-      // actual commits.
-      return new DeltaGetCommitsResponse().latestTableVersion(lastCommitDAO.getCommitVersion());
-    }
+          CommitQueryResult result = getUnbackfilledCommits(session, tableId);
 
-    // The last version to return if endVersion is not set. It's limited by pagination limit.
-    // In normal cases the pagination limitation should not happen at all since the limit is the
-    // same limit that a table can have as many unbackfilled commits as possible. But it is
-    // implemented this way just in case.
-    long paginatedEndVersionInclusive =
-        Math.max(startVersion, firstCommitDAO.getCommitVersion()) + MAX_NUM_COMMITS_PER_TABLE - 1;
-    // The actual last version to return
-    long effectiveEndVersionInclusive =
-        Math.min(endVersion.orElse(Long.MAX_VALUE), paginatedEndVersionInclusive);
+          // Apply version range filter + pagination
+          long paginatedEnd =
+              Math.max(startVersion, result.oldestVersion()) + MAX_NUM_COMMITS_PER_TABLE - 1;
+          long effectiveEnd = Math.min(endVersion.orElse(Long.MAX_VALUE), paginatedEnd);
 
-    // Filter result and return
-    List<DeltaCommitInfo> commits =
-        allCommitDAOsDesc.stream()
-            .filter(
-                c ->
-                    !c.isBackfilledLatestCommit()
-                        && c.getCommitVersion() >= startVersion
-                        && c.getCommitVersion() <= effectiveEndVersionInclusive)
-            .map(DeltaCommitDAO::toCommitInfo)
-            .collect(Collectors.toList());
-    return new DeltaGetCommitsResponse()
-        .commits(commits)
-        .latestTableVersion(lastCommitDAO.getCommitVersion());
+          List<DeltaCommitInfo> commits =
+              result.commits().stream()
+                  .filter(
+                      c ->
+                          c.getCommitVersion() >= startVersion
+                              && c.getCommitVersion() <= effectiveEnd)
+                  .map(DeltaCommitDAO::toCommitInfo)
+                  .collect(Collectors.toList());
+          return new DeltaGetCommitsResponse()
+              .commits(commits)
+              .latestTableVersion(result.latestTableVersion());
+        },
+        "Failed to get commits",
+        /* readOnly= */ true,
+        Optional.of(TRANSACTION_REPEATABLE_READ));
   }
 
   /**
@@ -223,40 +238,70 @@ public class DeltaCommitRepository {
   public void postCommit(DeltaCommit commit) {
     serverProperties.checkManagedTableEnabled();
     validateCommit(commit);
+    // Extract + shape-validate uniform fields outside the transaction. The subpath check (which
+    // needs the table URL) happens later inside validateTableForCommit; everything else
+    // uniform-related is settled here.
+    Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields =
+        DeltaUniformUtils.getUniformFields(commit);
     TransactionManager.executeWithTransaction(
         sessionFactory,
         session -> {
           UUID tableId = UUID.fromString(commit.getTableId());
           TableInfoDAO tableInfoDAO = session.get(TableInfoDAO.class, tableId);
           if (tableInfoDAO == null) {
-            throw new BaseException(ErrorCode.NOT_FOUND, "Table not found: " + commit.getTableId());
+            throw new BaseException(
+                ErrorCode.TABLE_NOT_FOUND, "Table not found: " + commit.getTableId());
           }
-          validateTableForCommit(commit, tableInfoDAO);
-          List<DeltaCommitDAO> firstAndLastCommits = getFirstAndLastCommits(session, tableId);
-          if (firstAndLastCommits.isEmpty()) {
-            handleOnboardingCommit(session, tableId, tableInfoDAO, commit);
-          } else {
-            DeltaCommitDAO firstCommitDAO = firstAndLastCommits.get(0);
-            DeltaCommitDAO lastCommitDAO = firstAndLastCommits.get(1);
-            assert firstCommitDAO.getCommitVersion() <= lastCommitDAO.getCommitVersion();
-            if (commit.getCommitInfo() == null) {
-              // This is already checked in validateCommit()
-              assert commit.getLatestBackfilledVersion() != null;
-              handleBackfillOnlyCommit(
-                  session,
-                  tableId,
-                  commit.getLatestBackfilledVersion(),
-                  firstCommitDAO.getCommitVersion(),
-                  lastCommitDAO.getCommitVersion());
-            } else {
-              handleNormalCommit(
-                  session, tableId, tableInfoDAO, commit, firstCommitDAO, lastCommitDAO);
-            }
-          }
+          validateTableForCommit(session, commit, tableInfoDAO, uniformFields);
+          postCommitCore(session, tableId, tableInfoDAO, commit, uniformFields);
           return null;
         },
         "Error committing to table: " + commit.getTableId(),
         /* readOnly = */ false);
+  }
+
+  /**
+   * Shared core of {@link #postCommit} and {@link #applyCommitAndBackfillInSession}: read the
+   * first/last commits and route to {@link #handleOnboardingCommit} (no prior commits + commit info
+   * present), {@link #handleBackfillOnlyCommit} (prior commits + commit info absent), or {@link
+   * #handleNormalCommit} (prior commits + commit info present). A backfill-only request against an
+   * empty commit log is rejected here directly with a caller-aware message.
+   */
+  private void postCommitCore(
+      Session session,
+      UUID tableId,
+      TableInfoDAO tableInfoDAO,
+      DeltaCommit commit,
+      Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields) {
+    List<DeltaCommitDAO> firstAndLastCommits = getFirstAndLastCommits(session, tableId);
+    if (firstAndLastCommits.isEmpty()) {
+      if (commit.getCommitInfo() == null) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            "Backfill request requires a prior commit; the table's commit log is empty.");
+      }
+      handleOnboardingCommit(session, tableId, tableInfoDAO, commit, uniformFields);
+    } else {
+      DeltaCommitDAO firstCommitDAO = firstAndLastCommits.get(0);
+      DeltaCommitDAO lastCommitDAO = firstAndLastCommits.get(1);
+      ValidationUtils.checkArgument(
+          firstCommitDAO.getCommitVersion() <= lastCommitDAO.getCommitVersion(),
+          "Inconsistent commit log: first commit version > last commit version.");
+      if (commit.getCommitInfo() == null) {
+        // latestBackfilledVersion non-null guaranteed upstream (UC REST: validateCommit;
+        // Delta update: DeltaUpdateTableMapper checkNotNull).
+        assert (commit.getLatestBackfilledVersion() != null);
+        handleBackfillOnlyCommit(
+            session,
+            tableId,
+            commit.getLatestBackfilledVersion(),
+            firstCommitDAO.getCommitVersion(),
+            lastCommitDAO.getCommitVersion());
+      } else {
+        handleNormalCommit(
+            session, tableId, tableInfoDAO, commit, uniformFields, firstCommitDAO, lastCommitDAO);
+      }
+    }
   }
 
   /**
@@ -276,15 +321,18 @@ public class DeltaCommitRepository {
    * @throws BaseException if the commit info is null
    */
   private static void handleOnboardingCommit(
-      Session session, UUID tableId, TableInfoDAO tableInfoDAO, DeltaCommit commit) {
+      Session session,
+      UUID tableId,
+      TableInfoDAO tableInfoDAO,
+      DeltaCommit commit,
+      Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields) {
     DeltaCommitInfo commitInfo = commit.getCommitInfo();
     ValidationUtils.checkArgument(
         commitInfo != null,
         "Field can not be null: %s in onboarding commit",
         DeltaCommit.JSON_PROPERTY_COMMIT_INFO);
     saveCommit(session, tableId, commitInfo);
-    Optional.ofNullable(commit.getMetadata())
-        .ifPresent(metadata -> updateTableMetadata(session, tableId, tableInfoDAO, metadata));
+    updateTableFromCommit(session, tableId, tableInfoDAO, commit, uniformFields);
   }
 
   /**
@@ -324,6 +372,70 @@ public class DeltaCommitRepository {
   }
 
   /**
+   * Apply commit-log changes (add-commit and/or set-latest-backfilled-version) for the Delta
+   * update-table endpoint, going through the shared {@link #postCommitCore} so the commit-log
+   * progression is identical to {@link #postCommit}. Differs from {@code postCommit} on three
+   * points:
+   *
+   * <ul>
+   *   <li>does not open its own transaction -- the caller ({@link
+   *       io.unitycatalog.server.persist.TableRepository}) holds it;
+   *   <li>does not validate table-URI equality -- the Delta endpoint resolves the table by name and
+   *       id;
+   *   <li>does not project commit metadata onto the DAO -- the Delta path sends metadata changes as
+   *       sibling {@code TableUpdate} actions which the mapper has already applied.
+   * </ul>
+   *
+   * <p>The metadata-location subpath check on {@code uniformFields} runs here (the table location
+   * comes from the DAO). Property/block-presence consistency is the responsibility of {@link
+   * io.unitycatalog.server.service.delta.DeltaUpdateTableMapper#applyUpdates}, which runs against
+   * the post-update {@link MutablePropertyMap} view; this method only sees the DAO.
+   *
+   * <p>Package-private because the only caller today is {@link
+   * io.unitycatalog.server.persist.TableRepository}; widen the visibility once a second caller
+   * needs it.
+   *
+   * @param session active Hibernate session owned by the caller's transaction.
+   * @param dao the table to commit.
+   * @param deltaCommitOpt the {@code add-commit} payload, if any; converted internally to the UC
+   *     {@link DeltaCommitInfo} shape before dispatch.
+   * @param uniformFields extracted + shape-validated UniForm-Iceberg fields from the same {@code
+   *     add-commit}, if any; must be empty when {@code deltaCommitOpt} is empty.
+   * @param latestBackfilledVersion the {@code set-latest-backfilled-version} target, if any. Same
+   *     value as the Delta wire field {@code latest-published-version}. When paired with {@code
+   *     deltaCommitOpt}, the helper runs both in one read of the commit log.
+   */
+  void applyCommitAndBackfillInSession(
+      Session session,
+      TableInfoDAO dao,
+      Optional<DeltaCommitInfo> commitInfoOpt,
+      Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields,
+      Optional<Long> latestBackfilledVersion) {
+    ValidationUtils.checkArgument(
+        commitInfoOpt.isPresent() || latestBackfilledVersion.isPresent(),
+        "At least one of add-commit or set-latest-backfilled-version is required.");
+    if (uniformFields.isPresent() && commitInfoOpt.isEmpty()) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT, "Uniform metadata requires an accompanying commit.");
+    }
+    serverProperties.checkManagedTableEnabled();
+    uniformFields.ifPresent(
+        uf ->
+            DeltaUniformUtils.requireMetadataLocationSubpath(
+                uf.metadataLocation(), NormalizedURL.from(dao.getUrl())));
+    // Same per-field commit-info check as the UC REST validateCommit path.
+    commitInfoOpt.ifPresent(DeltaCommitRepository::validateCommitInfo);
+    postCommitCore(
+        session,
+        dao.getId(),
+        dao,
+        new DeltaCommit()
+            .commitInfo(commitInfoOpt.orElse(null))
+            .latestBackfilledVersion(latestBackfilledVersion.orElse(null)),
+        uniformFields);
+  }
+
+  /**
    * Handles a normal commit operation that adds a new version to the table.
    *
    * <p>A normal commit is any commit after the initial onboarding commit. It must include commit
@@ -356,6 +468,7 @@ public class DeltaCommitRepository {
       UUID tableId,
       TableInfoDAO tableInfoDAO,
       DeltaCommit commit,
+      Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields,
       DeltaCommitDAO firstCommitDAO,
       DeltaCommitDAO lastCommitDAO) {
     DeltaCommitInfo commitInfo = Objects.requireNonNull(commit.getCommitInfo());
@@ -364,7 +477,7 @@ public class DeltaCommitRepository {
     long newCommitVersion = commitInfo.getVersion();
     if (newCommitVersion <= lastCommitVersion) {
       throw new BaseException(
-          ErrorCode.ALREADY_EXISTS,
+          ErrorCode.COMMIT_VERSION_CONFLICT,
           "Commit version already accepted. Current table version is " + lastCommitVersion);
     }
     if (newCommitVersion > lastCommitVersion + 1) {
@@ -388,8 +501,7 @@ public class DeltaCommitRepository {
     checkCommitLimit(
         tableId, newCommitVersion, latestBackfilledVersion, firstCommitDAO, lastCommitDAO);
     saveCommit(session, tableId, commitInfo);
-    Optional.ofNullable(commit.getMetadata())
-        .ifPresent(metadata -> updateTableMetadata(session, tableId, tableInfoDAO, metadata));
+    updateTableFromCommit(session, tableId, tableInfoDAO, commit, uniformFields);
     latestBackfilledVersion.ifPresent(
         latestBackfilled ->
             backfillCommits(
@@ -582,9 +694,12 @@ public class DeltaCommitRepository {
    * @return the number of commits actually deleted in this batch
    */
   private static int deleteCommitsUpTo(Session session, UUID tableId, long upToCommitVersion) {
+    // PostgreSQL does not support DELETE ... LIMIT directly; use a subquery with IN.
     NativeQuery<?> query =
         session.createNativeQuery(
-            "DELETE FROM uc_delta_commits WHERE table_id = :tableId AND commit_version <= :upToCommitVersion LIMIT :numCommitsPerBatch");
+            "DELETE FROM uc_delta_commits WHERE id IN "
+                + "(SELECT id FROM uc_delta_commits WHERE table_id = :tableId "
+                + "AND commit_version <= :upToCommitVersion LIMIT :numCommitsPerBatch)");
     query.setParameter("tableId", tableId);
     query.setParameter("upToCommitVersion", upToCommitVersion);
     query.setParameter("numCommitsPerBatch", NUM_COMMITS_PER_BATCH);
@@ -603,9 +718,12 @@ public class DeltaCommitRepository {
    * @return the number of commits actually deleted in this batch
    */
   private static int deleteCommits(Session session, UUID tableId) {
+    // PostgreSQL does not support DELETE ... LIMIT directly; use a subquery with IN.
     NativeQuery<?> query =
         session.createNativeQuery(
-            "DELETE FROM uc_delta_commits WHERE table_id = :tableId LIMIT :numCommitsPerBatch");
+            "DELETE FROM uc_delta_commits WHERE id IN "
+                + "(SELECT id FROM uc_delta_commits WHERE table_id = :tableId "
+                + "LIMIT :numCommitsPerBatch)");
     query.setParameter("tableId", tableId);
     query.setParameter("numCommitsPerBatch", NUM_COMMITS_PER_BATCH);
     return query.executeUpdate();
@@ -674,6 +792,40 @@ public class DeltaCommitRepository {
   }
 
   /**
+   * Updates table with metadata and uniform information from a commit, then persists changes.
+   *
+   * @param session the Hibernate session for database operations
+   * @param tableId the unique identifier of the table
+   * @param tableInfoDAO the table information data access object to update
+   * @param commit the commit request containing optional metadata and uniform information
+   */
+  private static void updateTableFromCommit(
+      Session session,
+      UUID tableId,
+      TableInfoDAO tableInfoDAO,
+      DeltaCommit commit,
+      Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields) {
+    boolean hasUpdates = false;
+
+    if (commit.getMetadata() != null) {
+      updateTableMetadata(session, tableId, tableInfoDAO, commit.getMetadata());
+      hasUpdates = true;
+    }
+
+    if (uniformFields.isPresent()) {
+      DeltaUniformUtils.applyToDao(tableInfoDAO, uniformFields);
+      hasUpdates = true;
+    }
+
+    if (hasUpdates) {
+      String callerId = IdentityUtils.findPrincipalEmailAddress();
+      tableInfoDAO.setUpdatedBy(callerId);
+      tableInfoDAO.setUpdatedAt(new Date());
+      session.merge(tableInfoDAO);
+    }
+  }
+
+  /**
    * Updates table metadata including properties, schema (columns), and description based on the
    * metadata provided in a commit. This method handles:
    *
@@ -717,11 +869,6 @@ public class DeltaCommitRepository {
       // Update comment
       tableInfoDAO.setComment(metadata.getDescription());
     }
-
-    String callerId = IdentityUtils.findPrincipalEmailAddress();
-    tableInfoDAO.setUpdatedBy(callerId);
-    tableInfoDAO.setUpdatedAt(new Date());
-    session.merge(tableInfoDAO);
   }
 
   /**
@@ -756,28 +903,7 @@ public class DeltaCommitRepository {
 
     // Validate the commit info object
     if (commit.getCommitInfo() != null) {
-      DeltaCommitInfo commitInfo = commit.getCommitInfo();
-      ValidationUtils.checkArgument(
-          commitInfo.getVersion() != null && commitInfo.getVersion() > 0,
-          "Field must be positive: %s",
-          DeltaCommitInfo.JSON_PROPERTY_VERSION);
-      ValidationUtils.checkArgument(
-          commitInfo.getTimestamp() != null && commitInfo.getTimestamp() > 0,
-          "Field must be positive: %s",
-          DeltaCommitInfo.JSON_PROPERTY_TIMESTAMP);
-      ValidationUtils.checkArgument(
-          commitInfo.getFileName() != null && !commitInfo.getFileName().isEmpty(),
-          "Field can not be empty: %s",
-          DeltaCommitInfo.JSON_PROPERTY_FILE_NAME);
-      ValidationUtils.checkArgument(
-          commitInfo.getFileSize() != null && commitInfo.getFileSize() > 0,
-          "Field must be positive: %s",
-          DeltaCommitInfo.JSON_PROPERTY_FILE_SIZE);
-      ValidationUtils.checkArgument(
-          commitInfo.getFileModificationTimestamp() != null
-              && commitInfo.getFileModificationTimestamp() > 0,
-          "Field must be positive: %s",
-          DeltaCommitInfo.JSON_PROPERTY_FILE_MODIFICATION_TIMESTAMP);
+      validateCommitInfo(commit.getCommitInfo());
       if (commit.getMetadata() != null) {
         DeltaMetadata metadata = commit.getMetadata();
         Optional<Map<String, String>> propertiesOpt =
@@ -797,30 +923,7 @@ public class DeltaCommitRepository {
               "At least one of description, properties, or schema must be set in commit.metadata");
         }
         if (propertiesOpt.isPresent()) {
-          Optional<String> propertiesTableIdOpt =
-              propertiesOpt.map(p -> p.get(TableProperties.UC_TABLE_ID_KEY));
-          if (propertiesTableIdOpt.isEmpty()) {
-            throw new BaseException(
-                ErrorCode.INVALID_ARGUMENT,
-                String.format(
-                    "commit does not contain %s in the properties.",
-                    TableProperties.UC_TABLE_ID_KEY));
-          }
-          if (!propertiesTableIdOpt.get().equals(commit.getTableId())) {
-            // This is to ensure that the Delta table's log on the file system has the table id
-            // stored as a property. An extra check to ensure that the filesystem-based information
-            // and the catalog-based information is in sync. for example, if some buggy connector
-            // accidentally updated table A on the file system, but send the commit to table B in
-            // UC, then this check will catch it as table A's properties in the log will have a
-            // different id than the table B's id in UC.
-            throw new BaseException(
-                ErrorCode.INVALID_ARGUMENT,
-                String.format(
-                    "the table being committed (%s) does not match the properties %s(%s).",
-                    commit.getTableId(),
-                    TableProperties.UC_TABLE_ID_KEY,
-                    propertiesTableIdOpt.get()));
-          }
+          UcManagedDeltaContract.validateTableIdProperty(propertiesOpt.get(), commit.getTableId());
         }
       }
     } else {
@@ -835,6 +938,35 @@ public class DeltaCommitRepository {
             ErrorCode.INVALID_ARGUMENT, "metadata shouldn't be set for backfill only commit");
       }
     }
+  }
+
+  /**
+   * Validates the 5 required fields of a commit-info block (version, timestamp, file name, file
+   * size, file modification timestamp). Shared by {@link #validateCommit} (UC REST) and {@link
+   * #applyCommitAndBackfillInSession} (Delta update path, via {@code toUcCommitInfo} first).
+   */
+  private static void validateCommitInfo(DeltaCommitInfo commitInfo) {
+    ValidationUtils.checkArgument(
+        commitInfo.getVersion() != null && commitInfo.getVersion() > 0,
+        "Field must be positive: %s",
+        DeltaCommitInfo.JSON_PROPERTY_VERSION);
+    ValidationUtils.checkArgument(
+        commitInfo.getTimestamp() != null && commitInfo.getTimestamp() > 0,
+        "Field must be positive: %s",
+        DeltaCommitInfo.JSON_PROPERTY_TIMESTAMP);
+    ValidationUtils.checkArgument(
+        commitInfo.getFileName() != null && !commitInfo.getFileName().isEmpty(),
+        "Field can not be empty: %s",
+        DeltaCommitInfo.JSON_PROPERTY_FILE_NAME);
+    ValidationUtils.checkArgument(
+        commitInfo.getFileSize() != null && commitInfo.getFileSize() > 0,
+        "Field must be positive: %s",
+        DeltaCommitInfo.JSON_PROPERTY_FILE_SIZE);
+    ValidationUtils.checkArgument(
+        commitInfo.getFileModificationTimestamp() != null
+            && commitInfo.getFileModificationTimestamp() > 0,
+        "Field must be positive: %s",
+        DeltaCommitInfo.JSON_PROPERTY_FILE_MODIFICATION_TIMESTAMP);
   }
 
   /**
@@ -867,17 +999,25 @@ public class DeltaCommitRepository {
   }
 
   /**
-   * Validates that a table is eligible for the commit and that the commit's table URI matches.
+   * Validate that the table is eligible for the commit and the commit's table URI matches.
    *
-   * <p>This method first validates the table meets all requirements for Delta commits, then ensures
-   * the table URI specified in the commit request matches the table's registered URI. URIs are
-   * standardized before comparison to handle format variations.
+   * <ul>
+   *   <li>Table eligibility ({@link #validateTable}: MANAGED + DELTA + non-null URL).
+   *   <li>Table URI equality: the URI in the commit must match the registered table URL after
+   *       normalization.
+   *   <li>UniForm subpath: when {@code uniformFields} is present, its {@code metadata-location}
+   *       must be a subpath of the table's storage root.
+   *   <li>UniForm property/block consistency via {@link #validateUniformMetadataPresence}.
+   * </ul>
    *
-   * @param commit the commit request containing the table URI
-   * @param tableInfoDAO the table information data access object
-   * @throws BaseException if validation fails or URIs don't match
+   * <p>{@code uniformFields} is the already-validated, already-normalized output of {@link
+   * DeltaUniformUtils#getUniformFields(DeltaCommit)}; this method only does the table-aware checks.
    */
-  private static void validateTableForCommit(DeltaCommit commit, TableInfoDAO tableInfoDAO) {
+  private static void validateTableForCommit(
+      Session session,
+      DeltaCommit commit,
+      TableInfoDAO tableInfoDAO,
+      Optional<DeltaUniformUtils.UniformIcebergFields> uniformFields) {
     validateTable(tableInfoDAO);
     NormalizedURL commitTableUri = NormalizedURL.from(commit.getTableUri());
     NormalizedURL tableUri = NormalizedURL.from(tableInfoDAO.getUrl());
@@ -886,6 +1026,38 @@ public class DeltaCommitRepository {
         "Table URI in commit %s does not match the table path %s",
         commit.getTableUri(),
         tableInfoDAO.getUrl());
+    uniformFields.ifPresent(
+        uf -> DeltaUniformUtils.requireMetadataLocationSubpath(uf.metadataLocation(), tableUri));
+    validateUniformMetadataPresence(session, commit, tableInfoDAO);
+  }
+
+  /**
+   * Validates the presence of uniform metadata inside commit. If the table has UniForm enabled
+   * after incoming commit, uniform metadata must exist inside commit Otherwise, if the table
+   * doesn't have UniForm enabled after incoming commit, uniform metadata must not exist inside
+   * commit
+   *
+   * @param session the Hibernate session for database operations
+   * @param commit the commit request that may contain uniform metadata
+   * @param tableInfoDAO the table information data access object
+   * @throws BaseException if validation is violated
+   */
+  private static void validateUniformMetadataPresence(
+      Session session, DeltaCommit commit, TableInfoDAO tableInfoDAO) {
+    Map<String, String> effectiveProperties;
+    // When properties are not null inside commit metadata, the incoming commit would update
+    // table properties
+    if (commit.getMetadata() != null && commit.getMetadata().getProperties() != null) {
+      effectiveProperties =
+          Optional.ofNullable(commit.getMetadata().getProperties().getProperties())
+              .orElse(Collections.emptyMap());
+    } else {
+      // Incoming commit doesn't update table properties. Get current table properties from database
+      List<PropertyDAO> properties =
+          PropertyRepository.findProperties(session, tableInfoDAO.getId(), Constants.TABLE);
+      effectiveProperties = PropertyDAO.toMap(properties);
+    }
+    DeltaUniformUtils.validateConsistency(effectiveProperties, commit.getUniform() != null);
   }
 
   /**

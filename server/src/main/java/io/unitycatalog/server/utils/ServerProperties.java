@@ -2,6 +2,7 @@ package io.unitycatalog.server.utils;
 
 import io.unitycatalog.server.exception.BaseException;
 import io.unitycatalog.server.exception.ErrorCode;
+import io.unitycatalog.server.model.TableType;
 import io.unitycatalog.server.service.credential.aws.S3StorageConfig;
 import io.unitycatalog.server.service.credential.azure.ADLSStorageConfig;
 import io.unitycatalog.server.service.credential.gcp.GcsStorageConfig;
@@ -18,6 +19,7 @@ import java.time.format.DateTimeParseException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -195,14 +197,20 @@ public class ServerProperties {
     CLIENT_SECRET("server.client-secret"),
     REDIRECT_PORT("server.redirect-port", POSITIVE_INTEGER_VALIDATOR),
     COOKIE_TIMEOUT("server.cookie-timeout", "P5D", DURATION_VALIDATOR),
-    MANAGED_TABLE_ENABLED("server.managed-table.enabled", "false", BOOLEAN_VALIDATOR),
-    MODEL_STORAGE_ROOT("storage-root.models", "file:///tmp/ucroot", STORAGE_PATH_VALIDATOR),
-    TABLE_STORAGE_ROOT("storage-root.tables", "file:///tmp/ucroot", STORAGE_PATH_VALIDATOR),
+    MANAGED_TABLE_ENABLED("server.managed-table.enabled", "true", BOOLEAN_VALIDATOR),
+    MANAGED_TABLE_USE_DELTA_API_ONLY(
+        "server.managed-table.use-delta-api-only", "false", BOOLEAN_VALIDATOR),
+    UNIFORM_ICEBERG_V2_ALLOW_MISSING_DV(
+        "server.managed-table.uniform-iceberg-v2.allow-missing-dv", "false", BOOLEAN_VALIDATOR),
+    // `storage-root.*` are replaced by managed storage locations of catalog and schema.
+    MODEL_STORAGE_ROOT("storage-root.models", STORAGE_PATH_VALIDATOR), // Deprecated
+    TABLE_STORAGE_ROOT("storage-root.tables", STORAGE_PATH_VALIDATOR), // Deprecated
     AWS_MASTER_ROLE_ARN("aws.masterRoleArn"),
     AWS_ACCESS_KEY("aws.accessKey"),
     AWS_SECRET_KEY("aws.secretKey"),
     AWS_SESSION_TOKEN("aws.sessionToken"),
-    AWS_REGION("aws.region");
+    AWS_REGION("aws.region"),
+    INCLUDE_STACK_TRACE_IN_ERROR("server.include-stacktrace-in-error", "false", BOOLEAN_VALIDATOR);
     // The is not an exhaustive list. Some property keys like s3.bucketPath.0 with a numbering
     // suffix is not included. They are only accessed internally from functions like
     // getS3Configurations.
@@ -353,13 +361,13 @@ public class ServerProperties {
         break;
       }
       String jsonKeyFilePath = getProperty("gcs.jsonKeyFilePath." + i);
-      String credentialsGenerator = getProperty("gcs.credentialsGenerator." + i);
+      String credentialGenerator = getProperty("gcs.credentialGenerator." + i);
       gcsConfigMap.put(
           NormalizedURL.from(bucketPath),
           GcsStorageConfig.builder()
               .bucketPath(bucketPath)
               .jsonKeyFilePath(jsonKeyFilePath)
-              .credentialsGenerator(credentialsGenerator)
+              .credentialGenerator(credentialGenerator)
               .build());
       i++;
     }
@@ -377,7 +385,7 @@ public class ServerProperties {
       String clientId = getProperty("adls.clientId." + i);
       String clientSecret = getProperty("adls.clientSecret." + i);
       String testMode = getProperty("adls.testMode." + i);
-      String credentialsGenerator = getProperty("adls.credentialsGenerator." + i);
+      String credentialGenerator = getProperty("adls.credentialGenerator." + i);
       if (storageAccountName == null
           || tenantId == null
           || clientId == null
@@ -392,7 +400,7 @@ public class ServerProperties {
               .clientId(clientId)
               .clientSecret(clientSecret)
               .testMode(testMode != null && testMode.equalsIgnoreCase("true"))
-              .credentialsGenerator(credentialsGenerator)
+              .credentialGenerator(credentialGenerator)
               .build());
       i++;
     }
@@ -445,6 +453,10 @@ public class ServerProperties {
     return isTrueOrEnable(get(Property.AUTHORIZATION_ENABLED));
   }
 
+  public boolean isIncludeStackTraceInError() {
+    return isTrueOrEnable(get(Property.INCLUDE_STACK_TRACE_IN_ERROR));
+  }
+
   /**
    * Check if experimental MANAGED table feature is enabled. This method throws BaseException with
    * ErrorCode.INVALID_ARGUMENT if it's disabled.
@@ -453,8 +465,99 @@ public class ServerProperties {
     if (!isTrueOrEnable(get(Property.MANAGED_TABLE_ENABLED))) {
       throw new BaseException(
           ErrorCode.INVALID_ARGUMENT,
-          "MANAGED table is an experimental feature and is currently disabled. "
-              + "To enable it, set 'server.managed-table.enabled=true' in server.properties");
+          "MANAGED table is an is currently disabled. To enable it, set "
+              + "'server.managed-table.enabled=true' in server.properties");
     }
+  }
+
+  /**
+   * Reject the UC request when MANAGED_TABLES_USE_DELTA_API_ONLY is on and the targeted table is
+   * MANAGED. Call from UC endpoints whose Delta equivalent should be used instead. Any non-MANAGED
+   * table would continue to work: EXTERNAL, METRIC_VIEW etc.
+   *
+   * @param tableType the table type to check; only {@link TableType#MANAGED} triggers the gate.
+   * @param deltaEndpoint full Delta endpoint to suggest in the error, e.g. {@code "POST
+   *     /delta/v1/catalogs/{catalog}/schemas/{schema}/tables"}.
+   */
+  public void checkDeltaApiOnlyForManagedTable(TableType tableType, String deltaEndpoint) {
+    if (tableType == TableType.MANAGED
+        && isTrueOrEnable(get(Property.MANAGED_TABLE_USE_DELTA_API_ONLY))) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "This Unity Catalog endpoint is disabled for MANAGED Delta tables when "
+              + Property.MANAGED_TABLE_USE_DELTA_API_ONLY.getKey()
+              + "=true. Use the Delta endpoint "
+              + deltaEndpoint
+              + " instead.");
+    }
+  }
+
+  /**
+   * Returns true when the server is configured to allow creation and writing of IcebergCompatV2
+   * tables ({@code delta.enableIcebergCompatV2=true}) without requiring deletion vectors. Set
+   * {@code server.managed-table.uniform-iceberg-v2.allow-missing-dv=true} in server.properties to
+   * enable.
+   */
+  public boolean isUniformIcebergV2AllowMissingDv() {
+    return isTrueOrEnable(get(Property.UNIFORM_ICEBERG_V2_ALLOW_MISSING_DV));
+  }
+
+  /**
+   * Similar to checkDeltaApiOnlyForManagedTable, reject the UC request when
+   * MANAGED_TABLES_USE_DELTA_API_ONLY is on and the target endpoint is for MANAGED tables only. In
+   * this case it doesn't need to check table type. Call from UC endpoints whose Delta equivalent
+   * should be used instead.
+   *
+   * @param deltaEndpoint full Delta endpoint to suggest in the error, e.g. {@code "POST
+   *     /delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables"}.
+   */
+  public void checkDeltaApiOnlyEnabled(String deltaEndpoint) {
+    if (isTrueOrEnable(get(Property.MANAGED_TABLE_USE_DELTA_API_ONLY))) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "This Unity Catalog endpoint is disabled when "
+              + Property.MANAGED_TABLE_USE_DELTA_API_ONLY.getKey()
+              + "=true. Use the Delta endpoint "
+              + deltaEndpoint
+              + " instead.");
+    }
+  }
+
+  /**
+   * Get the list of allowed token issuers.
+   *
+   * <p>When authorization is enabled, tokens will only be accepted from issuers in this list. This
+   * prevents attackers from using their own identity provider to forge tokens.
+   *
+   * @return List of allowed issuer URLs (exact match required)
+   */
+  public List<String> getAllowedIssuers() {
+    return getCommaSeparatedList("server.allowed-issuers");
+  }
+
+  /**
+   * Get the list of expected JWT audience values.
+   *
+   * <p>When authorization is enabled, tokens must contain one of these audience values. This
+   * ensures tokens are intended for this Unity Catalog instance.
+   *
+   * @return List of expected audience values
+   */
+  public List<String> getAudiences() {
+    return getCommaSeparatedList("server.audiences");
+  }
+
+  /**
+   * Parse a comma-separated property value into a list of trimmed, non-empty strings.
+   *
+   * @param key the property key to look up
+   * @return List of trimmed values, or empty list if the property is null or blank
+   */
+  private List<String> getCommaSeparatedList(String key) {
+    String value = getProperty(key);
+    if (value == null || value.isBlank()) {
+      return List.of();
+    }
+    return Arrays.stream(value.split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
   }
 }

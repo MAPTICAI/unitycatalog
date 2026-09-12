@@ -3,6 +3,7 @@ package io.unitycatalog.spark;
 import static io.unitycatalog.server.utils.TestUtils.CATALOG_NAME;
 import static io.unitycatalog.server.utils.TestUtils.SCHEMA_NAME;
 import static io.unitycatalog.server.utils.TestUtils.createApiClient;
+import static io.unitycatalog.spark.DeltaVersionUtils.MIN_DELTA_VERSION_FOR_UC_DELTA_API;
 
 import io.unitycatalog.client.ApiException;
 import io.unitycatalog.client.model.CreateCatalog;
@@ -13,7 +14,8 @@ import io.unitycatalog.server.base.catalog.CatalogOperations;
 import io.unitycatalog.server.base.schema.SchemaOperations;
 import io.unitycatalog.server.sdk.catalog.SdkCatalogOperations;
 import io.unitycatalog.server.sdk.schema.SdkSchemaOperations;
-import io.unitycatalog.server.service.credential.gcp.TestingCredentialsGenerator;
+import io.unitycatalog.server.service.credential.gcp.TestingCredentialGenerator;
+import io.unitycatalog.server.utils.ServerProperties;
 import io.unitycatalog.server.utils.TestUtils;
 import io.unitycatalog.spark.utils.OptionsUtil;
 import java.util.ArrayList;
@@ -29,6 +31,8 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
 
   protected ArrayList<String> createdCatalogs = new ArrayList<>();
   protected static final String SPARK_CATALOG = "spark_catalog";
+  /** S3 bucket with no credentials configured on server - for testing SSP fallback. */
+  public static final String NO_CREDS_BUCKET = "test-bucket-2-no-creds";
 
   private SchemaOperations schemaOperations;
   // Each test would create this session. It will be closed automatically.
@@ -44,10 +48,11 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
   }
 
   protected SparkSession createSparkSessionWithCatalogs(String... catalogs) {
-    return createSparkSessionWithCatalogs(false, catalogs);
+    return createSparkSessionWithCatalogs(true, true, catalogs);
   }
 
-  protected SparkSession createSparkSessionWithCatalogs(boolean renewCred, String... catalogs) {
+  protected SparkSession createSparkSessionWithCatalogs(
+      boolean renewCred, boolean credScopedFsEnabled, String... catalogs) {
     SparkSession.Builder builder =
         SparkSession.builder()
             .appName("test")
@@ -62,15 +67,16 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
               .config(catalogConf + "." + OptionsUtil.URI, serverConfig.getServerUrl())
               .config(catalogConf + "." + OptionsUtil.TOKEN, serverConfig.getAuthToken())
               .config(catalogConf + "." + OptionsUtil.WAREHOUSE, catalog)
-              .config(catalogConf + "." + OptionsUtil.RENEW_CREDENTIAL_ENABLED, renewCred);
+              .config(catalogConf + "." + OptionsUtil.RENEW_CREDENTIAL_ENABLED, renewCred)
+              .config(catalogConf + "." + OptionsUtil.CRED_SCOPED_FS_ENABLED, credScopedFsEnabled);
       if (!List.of(SPARK_CATALOG, CATALOG_NAME).contains(catalog)) {
         createTestCatalog(catalog);
       }
     }
     // Use fake file system for cloud storage so that we can test credentials.
-    builder.config("fs.s3.impl", S3CredentialTestFileSystem.class.getName());
-    builder.config("fs.gs.impl", GCSCredentialTestFileSystem.class.getName());
-    builder.config("fs.abfs.impl", AzureCredentialTestFileSystem.class.getName());
+    builder.config("spark.hadoop.fs.s3.impl", S3CredentialTestFileSystem.class.getName());
+    builder.config("spark.hadoop.fs.gs.impl", GCSCredentialTestFileSystem.class.getName());
+    builder.config("spark.hadoop.fs.abfs.impl", AzureCredentialTestFileSystem.class.getName());
     return builder.getOrCreate();
   }
 
@@ -97,6 +103,14 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
   @Override
   protected void setUpProperties() {
     super.setUpProperties();
+    // Delta >= 4.3.0 ships UCDeltaCatalogClientImpl / UCDeltaTokenBasedRestClient, so its
+    // managed-Delta create / commit / credential paths all go through the UC Delta API. Turn on
+    // the server-side enforcement on those matrix entries so we exercise the actual production
+    // configuration. Older Delta still has to use the UC-core writes; keep the flag off there.
+    if (DeltaVersionUtils.isDeltaAtLeast(MIN_DELTA_VERSION_FOR_UC_DELTA_API)) {
+      serverProperties.put(
+          ServerProperties.Property.MANAGED_TABLE_USE_DELTA_API_ONLY.getKey(), "true");
+    }
     serverProperties.put("s3.bucketPath.0", "s3://test-bucket0");
     serverProperties.put("s3.accessKey.0", "accessKey0");
     serverProperties.put("s3.secretKey.0", "secretKey0");
@@ -108,10 +122,10 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
 
     serverProperties.put("gcs.bucketPath.0", "gs://test-bucket0");
     serverProperties.put("gcs.jsonKeyFilePath.0", "testing://0");
-    serverProperties.put("gcs.credentialsGenerator.0", TestingCredentialsGenerator.class.getName());
+    serverProperties.put("gcs.credentialGenerator.0", TestingCredentialGenerator.class.getName());
     serverProperties.put("gcs.bucketPath.1", "gs://test-bucket1");
     serverProperties.put("gcs.jsonKeyFilePath.1", "testing://1");
-    serverProperties.put("gcs.credentialsGenerator.1", TestingCredentialsGenerator.class.getName());
+    serverProperties.put("gcs.credentialGenerator.1", TestingCredentialGenerator.class.getName());
 
     serverProperties.put("adls.storageAccountName.0", "test-bucket0");
     serverProperties.put("adls.tenantId.0", "tenantId0");
@@ -138,7 +152,6 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
   }
 
   @AfterEach
-  @Override
   public void cleanUp() {
     for (String catalogName : createdCatalogs) {
       try {
@@ -156,6 +169,5 @@ public abstract class BaseSparkIntegrationTest extends BaseCRUDTest {
     } catch (Exception e) {
       // Ignore
     }
-    super.cleanUp();
   }
 }

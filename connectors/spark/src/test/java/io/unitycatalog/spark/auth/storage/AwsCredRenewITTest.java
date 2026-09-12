@@ -2,8 +2,9 @@ package io.unitycatalog.spark.auth.storage;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 
-import io.unitycatalog.server.service.credential.aws.CredentialsGenerator;
-import io.unitycatalog.spark.UCHadoopConf;
+import io.unitycatalog.hadoop.internal.UCHadoopConfConstants;
+import io.unitycatalog.hadoop.internal.auth.AwsVendedTokenProvider;
+import io.unitycatalog.server.service.credential.aws.AwsCredentialGenerator;
 import java.time.Instant;
 import java.util.Map;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -24,7 +25,7 @@ public class AwsCredRenewITTest extends BaseCredRenewITTest {
     // Customize the test credential generator to issue a new credential every 30-second interval.
     // This allows us to verify whether credential renewal is functioning correctly by checking
     // if the current credential matches the expected time window.
-    serverProperties.put("s3.credentialsGenerator.0", CREDENTIALS_GENERATOR_CLASS);
+    serverProperties.put("s3.credentialGenerator.0", CREDENTIALS_GENERATOR_CLASS);
   }
 
   @Override
@@ -38,7 +39,7 @@ public class AwsCredRenewITTest extends BaseCredRenewITTest {
   }
 
   public static class AwsCredGenerator extends TimeBasedCredGenerator<Credentials>
-      implements CredentialsGenerator {
+      implements AwsCredentialGenerator {
     @Override
     protected Credentials newTimeBasedCred(long ts) {
       return Credentials.builder()
@@ -58,7 +59,7 @@ public class AwsCredRenewITTest extends BaseCredRenewITTest {
 
     @Override
     protected AwsCredentialsProvider createProvider() {
-      String clazz = getConf().get(UCHadoopConf.S3A_CREDENTIALS_PROVIDER);
+      String clazz = getConf().get(UCHadoopConfConstants.S3A_CREDENTIALS_PROVIDER);
       assertThat(clazz).isEqualTo(AwsVendedTokenProvider.class.getName());
 
       // This will validate if the hadoop configuration is correct or not, since it will fail the

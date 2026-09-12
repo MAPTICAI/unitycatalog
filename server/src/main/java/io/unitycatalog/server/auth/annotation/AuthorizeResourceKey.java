@@ -13,8 +13,8 @@ import java.lang.annotation.Target;
  * <p>Unlike {@link AuthorizeKey} which only exposes the raw value of ANY request field, this class
  * only annotates request fields that reference to resources and maps them to resource identifiers
  * (UUIDs). The resource key is used to retrieve the resource identifier, which is then used to
- * authorize the request. As an example, suppose you are making a request the retrieve a schema,
- * the parameter that contains the schema name might be defined in the request as:
+ * authorize the request. As an example, suppose you are making a request the retrieve a schema, the
+ * parameter that contains the schema name might be defined in the request as:
  *
  * <p>@AuthorizeResourceKey(SCHEMA) @Param("full_Name") String fullName
  *
@@ -35,7 +35,8 @@ import java.lang.annotation.Target;
  * <p>Method parameter level with Armeria @Param annotation - When used on a method parameter, and
  * the parameter also has annotated with the Armeria @Param annotation, the key is taken from
  * the @Param annotations value and that is what is used to retrieve the resource value. Since the
- * key is taken from the @Param, the key value in this annotation should be left unset.
+ * key is taken from the @Param, the key value in this annotation should be left unset; if it is set
+ * explicitly, it must equal the @Param value or registration fails.
  *
  * <p>Example: Map the request "catalog" parameter to the CATALOG resource type.
  *
@@ -50,7 +51,7 @@ import java.lang.annotation.Target;
  * <pre>{@code
  * public void serviceMethod(
  *   @AuthorizeResourceKey(value = CATALOG, key = "catalog") CreateSchemaRequest request) { }
- * </pre>
+ * }</pre>
  */
 @Retention(RetentionPolicy.RUNTIME)
 @Target({ElementType.METHOD, ElementType.PARAMETER})
